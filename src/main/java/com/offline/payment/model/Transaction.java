@@ -120,6 +120,14 @@ public class Transaction {
     public void setStatus(Status status) {
         this.status = status;
     }
+
+    public String getBridgeNodeId() {
+        return bridgeNodeId;
+    }
+
+    public void setBridgeNodeId(String bridgeNodeId) {
+        this.bridgeNodeId = bridgeNodeId;
+    }
 }
 
 /*
