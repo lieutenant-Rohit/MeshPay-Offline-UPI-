@@ -2,6 +2,7 @@ package com.offline.payment.controller;
 
 import com.offline.payment.model.MeshPacket;
 import com.offline.payment.service.PaymentProcessorService;
+import jakarta.validation.Valid;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
@@ -21,7 +22,7 @@ public class PaymentController {
      * Dave's gateway phone hits this exact URL when uploading a packet.
      */
     @PostMapping("/mesh/upload")
-    public ResponseEntity<?> uploadPacket(@RequestBody MeshPacket packet) {
+    public ResponseEntity<?> uploadPacket(@Valid @RequestBody MeshPacket packet) {
         try {
             // Send the packet down your secure verification pipeline
             paymentProcessorService.processIncomingPacket(packet);
