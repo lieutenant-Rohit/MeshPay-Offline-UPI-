@@ -25,8 +25,8 @@ public class PaymentProcessorService {
     private final TransactionRepository transactionRepository;
     private final LedgerService ledgerService;
 
-    // 24 hours in milliseconds (The maximum time a packet can bounce in the mesh)
-    private static final long MAX_PACKET_AGE_MILLIS = 24 * 60 * 60 * 1000;
+    // 24 hours in milliseconds
+    private static final long MAX_PACKET_AGE_MILLIS = 24L * 60 * 60 * 1000;
 
     public PaymentProcessorService(SignatureService signatureService,
                                    HybridCryptoService cryptoService,
@@ -41,66 +41,62 @@ public class PaymentProcessorService {
     }
 
     /**
-     * 🏦 The Master Method: Processes the incoming Mesh Packet
+     * Master pipeline: clone defense → sender lookup → signature verify
+     *                 → decrypt → freshness check → fund transfer → record
      */
     public void processIncomingPacket(MeshPacket packet) throws Exception {
 
-        // STEP 1: The Clone Defense (Idempotency)
-        // Generate a unique fingerprint (Hash) of the encrypted safe
+        // STEP 1: Clone / replay defense (idempotency)
         String packetHash = generatePacketHash(packet.getCiphertext());
-
         if (transactionRepository.existsByPacketHash(packetHash)) {
-            throw new SecurityException("Duplicate Packet Detected! This payment was already processed.");
+            throw new SecurityException("Duplicate packet detected — this payment was already processed.");
         }
 
-        // STEP 2: Fetch the Sender
+        // STEP 2: Fetch the sender's registered public key
         User sender = userRepository.findByVpa(packet.getSenderVpa())
-                .orElseThrow(() -> new SecurityException("User Not Found in Database!"));
+                .orElseThrow(() -> new SecurityException(
+                        "Sender VPA not found: " + packet.getSenderVpa()));
 
-        // STEP 3: Verify the Signature (The Wax Seal)
+        // STEP 3: Verify the digital signature (proves the packet was created by the sender)
         boolean isValid = signatureService.verifySignature(
                 packet.getCiphertext(),
                 packet.getSignature(),
                 sender.getPublicKey()
         );
-
         if (!isValid) {
-            throw new SecurityException("Signature Verification Failed! Dropping packet.");
+            throw new SecurityException("Signature verification failed — dropping packet.");
         }
 
-        // STEP 4: Decrypt the Safe
+        // STEP 4: Decrypt the payload
         String plainTextJson = cryptoService.decryptPayload(packet.getCiphertext());
         PaymentInstruction instruction = parseJsonToInstruction(plainTextJson);
 
-        // STEP 5: Final Authorization Checks
+        // STEP 5: Authorization cross-check — outer VPA must match inner VPA
         if (!instruction.getSenderVpa().equals(sender.getVpa())) {
-            throw new SecurityException("Authorization mismatch! Packet sender does not match payload sender.");
+            throw new SecurityException("Authorization mismatch — envelope sender differs from payload sender.");
         }
 
-        // STEP 6: The Zombie Defense (Freshness Check)
-        long currentTime = Instant.now().toEpochMilli();
-        long packetAge = currentTime - instruction.getSignedAt();
-
+        // STEP 6: Freshness check (zombie / replay packet defense)
+        long packetAge = Instant.now().toEpochMilli() - instruction.getSignedAt();
         if (packetAge > MAX_PACKET_AGE_MILLIS) {
-            throw new SecurityException("Packet Expired! This payment is older than 24 hours.");
+            throw new SecurityException("Packet expired — older than 24 hours.");
         }
 
-        // STEP 7: Move the Money!
+        // STEP 7: Move the money
         ledgerService.transferFunds(
                 instruction.getSenderVpa(),
                 instruction.getReceiverVpa(),
                 instruction.getAmount()
         );
 
-        // STEP 8: Write the Permanent Record
+        // STEP 8: Persist the permanent audit record
         saveTransactionRecord(packetHash, instruction, packet);
     }
 
-    // --- Helper Methods ---
+    // --- Helper methods ---
 
     private PaymentInstruction parseJsonToInstruction(String json) throws Exception {
-        ObjectMapper mapper = new ObjectMapper();
-        return mapper.readValue(json, PaymentInstruction.class);
+        return new ObjectMapper().readValue(json, PaymentInstruction.class);
     }
 
     private String generatePacketHash(String ciphertext) throws Exception {
@@ -109,7 +105,9 @@ public class PaymentProcessorService {
         return Base64.getEncoder().encodeToString(hashBytes);
     }
 
-    private void saveTransactionRecord(String packetHash, PaymentInstruction instruction, MeshPacket packet) {
+    private void saveTransactionRecord(String packetHash,
+                                       PaymentInstruction instruction,
+                                       MeshPacket packet) {
         Transaction tx = new Transaction();
         tx.setPacketHash(packetHash);
         tx.setSenderVpa(instruction.getSenderVpa());
@@ -117,10 +115,9 @@ public class PaymentProcessorService {
         tx.setAmount(instruction.getAmount());
         tx.setSignedAt(Instant.ofEpochMilli(instruction.getSignedAt()));
         tx.setSettleAt(Instant.now());
-        tx.setHopCount(5 - packet.getTtl()); // Calculate how many jumps it took
-        tx.setBridgeNodeId("Gateway-Node-ID"); // We will pass the real Dave's ID here later
+        tx.setHopCount(5 - packet.getTtl());
+        tx.setBridgeNodeId("Gateway-Node-ID");
         tx.setStatus(Transaction.Status.SETTLED);
-
         transactionRepository.save(tx);
     }
 }

@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  spring-bank:
+    build: .
+    ports:
+      - "8080:8080"
+    networks:
+      - mesh-net
+
+  node-5-gateway:
+    build: ./phone-node
+    depends_on:
+      spring-bank:
+        condition: service_started
+    environment:
+      - NODE_ID=Node-5
+      - NEXT_NODE_URL=http://spring-bank:8080/api/mesh/upload
+    networks:
+      - mesh-net
+
+  node-4:
+    build: ./phone-node
+    environment:
+      - NODE_ID=Node-4
+      - NEXT_NODE_URL=http://node-5-gateway:5001/receive
+    networks:
+      - mesh-net
+
+  node-3:
+    build: ./phone-node
+    environment:
+      - NODE_ID=Node-3
+      - NEXT_NODE_URL=http://node-4:5001/receive
+    networks:
+      - mesh-net
+
+  node-2:
+    build: ./phone-node
+    environment:
+      - NODE_ID=Node-2
+      - NEXT_NODE_URL=http://node-3:5001/receive
+    networks:
+      - mesh-net
+
+  node-1-alice:
+    build: ./phone-node
+    ports:
+      - "5001:5001"
+    environment:
+      - NODE_ID=Node-1
+      - NEXT_NODE_URL=http://node-2:5001/receive
+    networks:
+      - mesh-net
+
+networks:
+  mesh-net:
+    driver: bridge

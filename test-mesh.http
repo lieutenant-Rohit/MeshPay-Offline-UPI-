@@ -1,0 +1,71 @@
+### ==========================================================================
+### OFFLINE MESH PAYMENT — MANUAL TEST SEQUENCE
+###
+### HOW TO USE:
+###   Option A (automated): run `python alice_phone.py` — it does all steps.
+###   Option B (manual):    run requests in this file in order (1 → 2 → 3).
+###
+### IMPORTANT: The bank generates a NEW RSA keypair on every restart.
+###   You MUST re-run step 1 (provision) after each server restart to get
+###   the fresh bank public key, then re-run alice_phone.py to re-encrypt.
+###   The static keys below are only valid for one server session.
+### ==========================================================================
+
+### ===================================================================
+### PHASE 1: REGISTER USERS (run once per server session)
+### ===================================================================
+
+### 1a. Register Alice — copy alice's publicKey from alice_phone.py output
+POST http://localhost:8080/api/mesh/provision
+Content-Type: application/json
+
+{
+  "vpa": "alice@bank",
+  "publicKey": "PASTE_ALICE_PUBLIC_KEY_HERE"
+}
+
+###
+
+### 1b. Register Bob — copy bob's publicKey from bob_phone.py output
+### FIX: was "bob@upi" — must match "bob@bank" that alice_phone.py sends money to
+POST http://localhost:8080/api/mesh/provision
+Content-Type: application/json
+
+{
+  "vpa": "bob@bank",
+  "publicKey": "PASTE_BOB_PUBLIC_KEY_HERE"
+}
+
+###
+
+### ===================================================================
+### PHASE 2: SEND THE PAYMENT (copy packet from alice_phone.py output)
+### ===================================================================
+
+### 2. Alice's encrypted mesh packet → bank gateway
+### Copy the full JSON printed by alice_phone.py and paste here
+POST http://localhost:8080/api/mesh/upload
+Content-Type: application/json
+
+{
+  "packetId": "PASTE_PACKET_ID_HERE",
+  "ttl": 5,
+  "createdAt": 0,
+  "senderVpa": "alice@bank",
+  "signature": "PASTE_SIGNATURE_HERE",
+  "ciphertext": "PASTE_CIPHERTEXT_HERE"
+}
+
+###
+
+### ===================================================================
+### PHASE 3: VERIFY (H2 console)
+### ===================================================================
+### Open http://localhost:8080/h2-console
+###   JDBC URL:  jdbc:h2:mem:paymentdb
+###   User:      sa   Password: (blank)
+###
+### Run these queries:
+###   SELECT * FROM accounts;       -- check alice balance dropped by 500
+###   SELECT * FROM transactions;   -- check SETTLED record
+###   SELECT * FROM users;          -- check both VPAs registered

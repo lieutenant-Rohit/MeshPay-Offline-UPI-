@@ -35,21 +35,18 @@ public class SignatureService {
         return Base64.getEncoder().encodeToString(digitalSignature);
     }
 
-    public boolean verifySignature(String cipherText, String signatureBase64, PublicKey userPublicKey)throws Exception
-    {
-        //1-> Build the same signature machine
+    public boolean verifySignature(String cipherText, String signatureBase64, PublicKey userPublicKey) throws Exception {
+        // DEFENSIVE FIX: Remove all characters that are not in the Base64 alphabet.
+        // This strips out the '.' (2e) character and any other transit artifacts.
+        String cleanSignature = signatureBase64.replaceAll("[^A-Za-z0-9+/=]", "");
+
         Signature signatureMachine = Signature.getInstance(SIGNATURE_ALGORITHM);
-
-        //2-> Insert the user's Public key and set to "Verify" mode
         signatureMachine.initVerify(userPublicKey);
-
-        //3-> Feed the same cipher text into the machine
         signatureMachine.update(cipherText.getBytes());
 
-        //4-> Decode the signature from the MeshPacket back into raw bytes
-        byte[] signatureBytes = Base64.getDecoder().decode(signatureBase64);
+        // Use the cleaned string
+        byte[] signatureBytes = Base64.getDecoder().decode(cleanSignature);
 
-        //5-> Moment of Truth!-> Does the match hold up?
         return signatureMachine.verify(signatureBytes);
     }
 }

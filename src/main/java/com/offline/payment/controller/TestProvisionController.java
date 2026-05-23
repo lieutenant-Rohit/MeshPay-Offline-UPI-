@@ -27,30 +27,47 @@ public class TestProvisionController {
     }
 
     /**
-     * Simulates a user downloading the app on Wi-Fi and registering with the Bank.
+     * Registers a user (Alice or Bob) and creates their account.
+     * Call this once for alice@bank, then once for bob@bank.
+     *
+     * FIX: previously hardcoded bob@upi and "Bob" regardless of the request body,
+     * so alice_phone.py's payment to "bob@bank" always failed with "Receiver not found".
+     * Now each call provisions exactly the VPA that was sent in the request.
+     *
+     * FIX #2: Always update the public key even if the user already exists.
+     * This prevents stale/invalid keys (e.g. from DataInitializer) from
+     * causing signature verification failures later on upload.
      */
     @PostMapping("/mesh/provision")
     public Map<String, String> provisionDevice(@RequestBody Map<String, String> request) {
         String userVpa = request.get("vpa");
         String userPublicKey = request.get("publicKey");
 
-        // 1. Save Alice's identity and Public Key to the DB
-        User alice = new User();
-        alice.setVpa(userVpa);
-        alice.setPublicKeyBase64(userPublicKey);
-        userRepository.save(alice);
+        // Always save/update the user's public key (upsert semantics)
+        User user = userRepository.findById(userVpa).orElseGet(User::new);
+        user.setVpa(userVpa);
+        user.setPublicKeyBase64(userPublicKey);
+        userRepository.save(user);
 
-        // 2. Give Alice and Bob some starting money using YOUR exact constructor
-        Account aliceAccount = new Account(userVpa, "Alice", new BigDecimal("5000.00"));
-        accountRepository.save(aliceAccount);
+        // Create account only if it doesn't already exist
+        if (!accountRepository.existsById(userVpa)) {
+            BigDecimal startingBalance = new BigDecimal("5000.00");
+            String holderName = deriveHolderName(userVpa);
+            Account account = new Account(userVpa, holderName, startingBalance);
+            accountRepository.save(account);
+        }
 
-        Account bobAccount = new Account("bob@upi", "Bob", new BigDecimal("1000.00"));
-        accountRepository.save(bobAccount);
-
-        // 3. Hand the Bank's real Public Key back to Alice's phone
         return Map.of(
                 "status", "Provisioned Successfully",
+                "vpa", userVpa,
                 "bankPublicKey", serverKeyHolder.getPublicKeyBase64()
         );
+    }
+
+    /** Derives a display name from the VPA prefix (e.g. "alice@bank" → "Alice"). */
+    private String deriveHolderName(String vpa) {
+        if (vpa == null || !vpa.contains("@")) return vpa;
+        String prefix = vpa.split("@")[0];
+        return prefix.substring(0, 1).toUpperCase() + prefix.substring(1);
     }
 }
