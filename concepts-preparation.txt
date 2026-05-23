@@ -1,0 +1,1828 @@
+================================================================================
+                      COMPLETE PROJECT DEEP DIVE
+               Offline UPI Payment — Mesh Network
+================================================================================
+
+This document explains every component in the project in detail: what it is,
+why we chose it, its role, and how it works internally.  At the end, a full
+section on what would change for a real-time offline mesh.
+
+Read top to bottom for a complete understanding, or jump to any section.
+
+TABLE OF CONTENTS
+  1.  Project Overview
+  2.  System Architecture
+  3.  Mesh Networking
+  4.  Greedy Geographic Routing
+  5.  Topology (mesh-topology.json)
+  6.  Mesh Node (phone-node/node.py)
+  7.  Debug Endpoint
+  8.  Docker & Docker Compose
+  9.  Spring Boot Bank Server
+  10. Hybrid Encryption (AES-256-GCM + RSA-OAEP)
+  11. Digital Signatures (SHA256withRSA)
+  12. TTL (Time To Live)
+  13. Replay Attack Protection
+  14. Packet Freshness (Zombie Defense)
+  15. Provisioning Flow
+  16. Dedup in the Mesh
+  17. Visualizer (Flask SSE Server)
+  18. HTML5 Canvas Dashboard
+  19. Data Flow End-to-End
+  20. Design Patterns Used
+  21. Java Concepts Used
+  22. Python Concepts Used
+  23. Glossary
+  24. Interview Questions & Answers
+  25. Changes Needed for Real-Time Offline Mesh
+
+
+================================================================================
+1. PROJECT OVERVIEW
+================================================================================
+
+What is it?
+  A simulated offline payment system. Alice wants to pay Bob ₹500 using UPI,
+  but there is no internet. Instead, her phone is part of a mesh network where
+  packets hop from phone to phone until they reach a bank server.
+
+Key Idea:
+  Each phone node has a position (like GPS coordinates). When a packet arrives,
+  the node picks the neighbor that is geographically closest to the bank and
+  forwards the packet there. This is called "greedy geographic routing."
+
+Why Offline?
+  Real UPI requires internet. In rural areas, disaster zones, or crowded
+  events, internet may be unavailable. Mesh networking lets phones relay
+  payments without any centralized infrastructure.
+
+Components:
+  - 10 mesh nodes (Python/Flask, each in a Docker container)
+  - 1 bank server (Java/Spring Boot)
+  - 1 visualizer (Python/Flask with HTML5 Canvas)
+  - 1 topology config file (JSON)
+  - 2 client scripts (alice_phone.py, demo_mesh.py)
+
+Security:
+  The payment is encrypted with AES-256-GCM, the AES key is wrapped with
+  RSA-2048 OAEP, and the whole packet is signed with SHA256withRSA.
+  The bank performs 8 security checks before settling.
+
+
+================================================================================
+2. SYSTEM ARCHITECTURE
+================================================================================
+
+                    ┌──────────────────────────────────────────┐
+                    │          Docker Compose (mesh-net)       │
+                    │                                          │
+                    │  ┌──────────┐   ┌──────────┐             │
+                    │  │ Visualizer│  │SpringBank│             │
+                    │  │ :5002    │   │ :8080    │             │
+                    │  └────┬─────┘   └────▲─────┘             │
+                    │       │              │                   │
+                    │  ┌────▼──────────────┴──────────────┐    │
+                    │  │       10 Mesh Nodes              │    │
+                    │  │  Node-1 ─ Node-5 ─ Node-9        │    │
+                    │  │  Node-2 ─ Node-4 ─ Node-8        │    │
+                    │  │  Node-3 ─ Node-6 ─ Node-10 ─ Bank│    │
+                    │  └──────────────────────────────────┘    │
+                    │         📁 mesh-topology.json            │
+                    │         (mounted read-only on all)       │
+                    └──────────────────────────────────────────┘
+                               ▲
+                               │ HTTP POST /receive
+                    ┌──────────┴──────────┐
+                    │  alice_phone.py     │
+                    │  or demo_mesh.py    │
+                    └─────────────────────┘
+
+Layers:
+  1. Client Layer: alice_phone.py, demo_mesh.py — send packets into the mesh.
+  2. Mesh Layer: 10 Docker containers running node.py — route packets greedily.
+  3. Bank Layer: Spring Boot server — decrypt, verify, settle.
+  4. Visualizer Layer: Flask server + Browser — real-time hop visualization.
+
+Communication:
+  - Client → Node-1: HTTP POST /receive
+  - Node → Node: HTTP POST /receive (each hop)
+  - Node → Bank: HTTP POST /api/mesh/upload (last hop)
+  - Node → Visualizer: HTTP POST /hop (fire-and-forget reporting)
+  - Visualizer → Browser: SSE (Server-Sent Events)
+
+
+================================================================================
+3. MESH NETWORKING
+================================================================================
+
+What is a Mesh Network?
+  A mesh network is a topology where each node connects directly to multiple
+  other nodes. There is no single central hub. Data can travel along multiple
+  paths to reach its destination.
+
+Comparison of Topologies:
+
+  Star:
+      ┌─┐     ┌─┐
+      │N├─────┤H│
+      └─┘     ├─┤
+      ┌─┐     │U│     ┌─┐
+      │N├─────┤B│─────│N│
+      └─┘     └─┘     └─┘
+    - All nodes connect to a central hub.
+    - Hub fails → entire network dies.
+    - Range limited to hub's coverage.
+
+  Linear Chain:
+      N──N──N──N──N──N
+    - Simple, predictable path.
+    - One broken link splits the network.
+    - Latency = O(n) for n nodes.
+
+  Mesh:
+      N──N──N
+      │╲│╱│╲│
+      N──N──N
+      │╱│╲│╱│
+      N──N──N
+    - Multiple paths between any two nodes.
+    - Self-healing: if one node dies, traffic routes around it.
+    - Higher range: packets can hop through intermediate nodes.
+    - More complex routing needed.
+
+Why Mesh for Offline Payments?
+  In a real offline scenario, phones communicate via Bluetooth or WiFi Direct.
+  Not every phone is in range of the bank. But Phone A might be in range of
+  Phone B, which is in range of Phone C, which IS in range of the bank.
+  The mesh lets the payment "hop" through intermediate phones.
+
+Our Implementation:
+  10 nodes in a 3×3 grid with diagonal connections, plus a gateway node and
+  the bank.  Packets enter at Node-1 and greedily route toward the bank.
+
+
+================================================================================
+4. GREEDY GEOGRAPHIC ROUTING
+================================================================================
+
+What Is It?
+  A routing algorithm where each node forwards a packet to the neighbor that
+  is geographically closest to the final destination. "Greedy" means it makes
+  the locally optimal choice at each step without considering the global path.
+
+Why This Algorithm?
+  - Simple: just compare distances. O(n) per hop for n neighbors.
+  - No routing tables: no need to exchange route info between nodes.
+  - Works with any topology: just need positions and neighbor list.
+  - Predictable: packets follow a smooth path toward the destination.
+
+The Math:
+  distance(a, b) = sqrt((a.x - b.x)^2 + (a.y - b.y)^2)
+
+The Algorithm (step by step):
+  1. Node receives packet.
+  2. Get the destination position (Bank's x, y).
+  3. For each neighbor, compute distance from that neighbor to Bank.
+  4. Pick the neighbor with the smallest distance.
+  5. If that distance is less than the node's own distance to Bank → forward.
+  6. If the node itself is closest → send directly to Bank (it's the gateway).
+
+Example Trace:
+  Bank is at (400, 450).
+
+  Node-1 at (0,0):
+    - Node-2 at (150,0):  dist to Bank = sqrt((400-150)^2 + (450-0)^2)   ≈ 515
+    - Node-4 at (0,150):  dist to Bank = sqrt((400-0)^2 + (450-150)^2)   = 500
+    - Node-5 at (150,150): dist to Bank = sqrt((400-150)^2 + (450-150)^2) ≈ 391
+    → Picks Node-5 (closest to Bank).
+
+  Node-5 at (150,150):
+    - Neighbors include Node-9 (300,300): dist to Bank ≈ 180
+    → Picks Node-9.
+
+  Node-9 at (300,300):
+    - Neighbors include Node-10 (400,300): dist to Bank = 150
+    → Picks Node-10.
+
+  Node-10 at (400,300):
+    - Bank (400,450): dist to Bank = 0
+    → Forwards directly to Bank.
+
+  Final path: Node-1 → Node-5 → Node-9 → Node-10 → Bank (4 hops).
+
+  Old linear path was: N1→N2→N3→N4→N5→N6→N7→N8→N9→N10→Bank (10 hops).
+  Greedy is 60% shorter.
+
+Limitation (Local Minimum Problem):
+  Consider a U-shaped topology where the best next hop would move away from
+  the destination to go around an obstacle. Greedy can get stuck because
+  every neighbor is further from the destination than the current node.
+  Solutions:
+    - Face routing: switch to perimeter mode when greedy fails.
+    - Add more connections to create alternative paths.
+  Our grid with diagonals avoids this problem.
+
+
+================================================================================
+5. TOPOLOGY (mesh-topology.json)
+================================================================================
+
+What It Is:
+  A JSON configuration file that defines the entire mesh: every node, its
+  position, its neighbors, its URL, and the bank's URL.  Every container
+  mounts this file read-only at /app/mesh-topology.json.
+
+Why a Config File Instead of Environment Variables?
+  With 10 nodes and many neighbors per node, environment variables become
+  unmanageable. A single JSON file is cleaner, less error-prone, and easy
+  to modify.
+
+Structure Explained:
+
+  {
+    "nodes": [
+      {"id": "Node-1", "x": 0, "y": 0},
+      ...
+    ]
+    "neighbors": {
+      "Node-1": ["Node-2", "Node-4", "Node-5"],
+      ...
+    },
+    "bankUrl": "http://spring-bank:8080/api/mesh/upload",
+    "bankNodeId": "Bank",
+    "nodeUrls": {
+      "Node-1": "http://node-1-alice:5001",
+      ...
+    }
+  }
+
+  - "nodes": list of all mesh members with their (x,y) coordinates.
+    x and y are abstract units, not pixels. They represent relative position.
+
+  - "neighbors": adjacency list. Each entry lists which nodes this node can
+    directly communicate with. Must be symmetric (if A lists B, B must list A).
+
+  - "bankUrl": where to forward packets that reach the gateway. This is the
+    Spring Boot server's upload endpoint.
+
+  - "bankNodeId": which node is the bank in the nodes list. Used to get the
+    bank's position for distance calculations.
+
+  - "nodeUrls": maps node IDs to their Docker service URLs. Each node
+    constructs the full URL by appending "/receive" to its target's URL.
+
+Our Grid Layout (3x3 + Gateway):
+
+  Node-1 (0,0)    Node-2 (150,0)   Node-3 (300,0)
+  Node-4 (0,150)  Node-5 (150,150) Node-6 (300,150)
+  Node-7 (0,300)  Node-8 (150,300) Node-9 (300,300)
+                                      |
+                                   Node-10 (400,300)
+                                      |
+                                   Bank (400,450)
+
+Neighbor Design Philosophy:
+  - Every node connects to its orthogonal neighbors (up, down, left, right).
+  - Every node connects to its diagonal neighbors (shortcut paths).
+  - This creates 2-3 redundant paths between any two nodes.
+  - The greedy algorithm can now choose between multiple equally-good paths.
+
+
+================================================================================
+6. MESH NODE (phone-node/node.py)
+================================================================================
+
+What It Is:
+  A Python Flask web server that runs inside each Docker container. It
+  receives packets, makes routing decisions, and forwards them.
+
+Why Flask?
+  - Simple: minimal boilerplate, fast to prototype.
+  - Lightweight: small Docker images (Python 3.11-slim is ~120MB).
+  - Widely understood: any Python developer can read and modify it.
+  - For a 10-node demo, Flask's single-threaded server is sufficient.
+
+Role:
+  - Listen on port 5001.
+  - On startup: load mesh-topology.json, find its own node entry (by NODE_ID
+    env var), identify its own position and neighbors.
+  - POST /receive: process incoming packet, apply routing logic, forward.
+  - GET /debug: return routing state, neighbor distances, history.
+  - GET /health: return liveness status.
+
+Step-by-Step Execution of POST /receive:
+
+  1. Parse Request Body
+     packet = request.json
+     Extract packetId, ttl, senderVpa, signature, ciphertext.
+
+  2. Report RECEIVED to Visualizer
+     POST /hop with node_id, packet_id, action="RECEIVED", ttl, timestamp.
+     Fire-and-forget: wrapped in try/except so visualizer failure doesn't
+     break routing.
+
+  3. Zombie Defense (TTL Check)
+     if ttl <= 0: report DROPPED, return 400.
+     Prevents infinite loops and expired packets from wasting bandwidth.
+
+  4. Decrement TTL
+     packet['ttl'] -= 1.  This hop consumed one unit of TTL.
+
+  5. Find Best Gateway
+     Call best_gateway():
+       For each neighbor, compute distance(neighbor_pos, bank_pos).
+       Return the neighbor ID with the smallest distance, plus all options.
+
+  6. Record Routing Decision
+     Append to routing_history (kept in memory, capped at 50 entries):
+       packetId, selfDistToBank, all neighborOptions, chosenGateway.
+
+  7. Check for "No Neighbors"
+     If target is None: report END_OF_LINE, return 200.
+     Shouldn't happen in our topology, but handles misconfiguration.
+
+  8. Gateway Case (target is Bank or "Bank")
+     Forward directly to bankUrl via HTTP POST.
+     Report FORWARDED → then wait for bank response.
+     Report Bank RECEIVED → then SETTLED or REJECTED based on HTTP status.
+     Return the bank's response wrapped in this node's response.
+
+  9. Normal Forward Case (target is another mesh node)
+     Construct neighbor URL from nodeUrls[target] + "/receive".
+     Report FORWARDED with to_node field.
+     POST to neighbor.
+     Return neighbor's response wrapped in this node's response.
+
+  10. Error Handling
+      If any POST fails (timeout, connection refused), log the error and
+      return 500.  Currently no retry logic.
+
+How Routing History Works:
+  - A Python list that stores the last 50 routing decisions.
+  - Each entry includes: packetId, selfDistToBank, neighborOptions (array of
+    {neighbor, position, distanceToBank}), chosenGateway, chosenDistToBank.
+  - Served via GET /debug so operators can inspect routing behavior.
+
+
+================================================================================
+7. DEBUG ENDPOINT
+================================================================================
+
+What It Is:
+  GET /debug on every mesh node returns a JSON object showing:
+    - The node's identity and position.
+    - All reachable neighbors with their distances to the bank.
+    - The last 20 routing decisions.
+
+Purpose:
+  - Validate that the greedy algorithm is working correctly.
+  - Debug routing issues: see which neighbor was picked and why.
+  - Observe how the routing table changes if the topology is modified.
+
+Example Output:
+  {
+    "nodeId": "Node-1",
+    "position": {"id": "Node-1", "x": 0, "y": 0},
+    "neighbors": ["Node-2", "Node-4", "Node-5"],
+    "selfDistanceToBank": 602.1,
+    "neighborDistancesToBank": [
+      {"neighbor": "Node-2", "position": {...}, "distanceToBank": 514.8},
+      {"neighbor": "Node-4", "position": {...}, "distanceToBank": 500.0},
+      {"neighbor": "Node-5", "position": {...}, "distanceToBank": 390.5}
+    ],
+    "routingHistory": [
+      {
+        "packetId": "PKT_DEMO_...",
+        "selfDistToBank": 602.1,
+        "neighborOptions": [...],
+        "chosenGateway": "Node-5",
+        "chosenDistToBank": 390.5,
+        "timestamp": 1779527118174
+      }
+    ]
+  }
+
+How to Access:
+  Node-1 is exposed on host port 5001:
+    curl http://localhost:5001/debug
+  Other nodes are only reachable within the Docker network:
+    docker exec payment-node-5-1 curl http://localhost:5001/debug
+
+
+================================================================================
+8. DOCKER & DOCKER COMPOSE
+================================================================================
+
+What is Docker?
+  A containerization platform. An application and all its dependencies
+  (Python, Flask, Java, Maven, etc.) are packaged into an "image." This
+  image can be run as a "container" on any machine with Docker installed.
+  Containers are isolated from each other but can communicate over networks.
+
+Why Docker for This Project?
+  - Reproducibility: the exact same environment on any machine.
+  - Isolation: each node has its own filesystem, network stack.
+  - Networking: Docker's bridge network lets containers find each other by
+    service name (e.g., http://node-5:5001).
+  - Orchestration: Docker Compose manages all 12 containers with one command.
+  - Port mapping: host port 5001 → container port 5001 for Node-1.
+  - Volume mounting: mesh-topology.json is injected into every container.
+
+What is Docker Compose?
+  A tool for defining and running multi-container Docker applications.
+  A docker-compose.yml file specifies:
+    - services (which images to run)
+    - ports (which host ports map to which container ports)
+    - environment (environment variables for each container)
+    - volumes (files to mount into containers)
+    - networks (how containers communicate)
+    - depends_on (startup ordering)
+
+Our docker-compose.yml Structure:
+
+  services:
+    visualizer:        # Flask SSE server on port 5002
+    spring-bank:       # Spring Boot on port 8080
+    node-1-alice:      # Mesh node, port 5001 exposed to host
+    node-2:            # Mesh node, no host port
+    node-3:
+    ...
+    node-10-gateway:   # Mesh node, depends_on spring-bank
+
+  Each node service has:
+    - build: ./phone-node  (builds the Docker image from phone-node/Dockerfile)
+    - environment:
+        NODE_ID: "Node-X"          # Which node am I?
+        VISUALIZER_URL: "http://visualizer:5002"  # Where to report
+    - volumes:
+        - ./mesh-topology.json:/app/mesh-topology.json:ro
+          # Mount the topology config as read-only inside the container
+    - networks:
+        - mesh-net  # All services on the same bridge network
+
+  The network "mesh-net" allows:
+    - node-1-alice:5001 to reach node-5:5001
+    - node-10-gateway:5001 to reach spring-bank:8080
+    - All nodes to reach visualizer:5002
+
+Startup Order:
+  - visualizer starts first (no dependencies).
+  - spring-bank starts after visualizer.
+  - node-10-gateway starts after spring-bank (it needs the bank to be ready).
+  - Other 9 nodes start in parallel (no dependencies).
+
+Why No NEXT_NODE_URL Anymore?
+  - The old design had a fixed linear chain: each node had one NEXT_NODE_URL.
+  - Now, each node reads mesh-topology.json and dynamically picks a neighbor.
+  - This makes the topology configurable without changing environment variables.
+
+
+================================================================================
+9. SPRING BOOT BANK SERVER
+================================================================================
+
+What is Spring Boot?
+  A Java framework for building production-grade web applications. It embeds
+  a Tomcat server so you don't need to deploy a separate web server. It
+  provides auto-configuration (sensible defaults) and dependency injection.
+
+Why Spring Boot for the Bank?
+  - Production-ready: proper error handling, logging, security.
+  - JPA: easy database access with H2.
+  - JCE (Java Cryptography Extension): built-in support for AES-256-GCM and
+    RSA-OAEP with SHA-256 (harder to configure in Python).
+  - Type safety: Java's compiler catches many errors at build time.
+  - Testing: Spring Boot's test framework makes unit testing easy.
+
+Architecture of the Bank Server:
+
+  ┌──────────────────────────────────────────────────┐
+  │              PaymentController                   │
+  │  @RestController                                 │
+  │  POST /api/mesh/upload → processIncomingPacket() │
+  │  POST /api/mesh/provision → register user        │
+  └────────────────────┬─────────────────────────────┘
+                       │
+                       ▼
+  ┌────────────────────────────────────────────────┐
+  │          PaymentProcessorService               │
+  │  @Service                                      │
+  │  processIncomingPacket() — 8-step pipeline     │
+  └────┬─────┬─────┬─────┬─────┬─────┬─────┬───────┘
+       │     │     │     │     │     │     │
+       ▼     ▼     ▼     ▼     ▼     ▼     ▼
+    ┌───┐ ┌───┐ ┌───┐ ┌───┐ ┌───┐ ┌───┐ ┌───┐
+    │Rep│ │Sig│ │Dec│ │CVC│ │Age│ │Bal│ │Tx │
+    │lay│ │   │ │   │ │   │ │   │ │   │ │   │
+    └───┘ └───┘ └───┘ └───┘ └───┘ └───┘ └───┘
+               │                 │       │
+               ▼                 ▼       ▼
+        HybridCrypto      LedgerService  Transaction
+        Service                          Repository
+  ┌───────────────┐     ┌────────────┐  ┌──────────┐
+  │decryptPayload()│   │transferFunds│  │JPA CRUD  │
+  └───────────────┘     └────────────┘  └──────────┘
+
+Key Classes:
+
+  PaymentController.java
+    - @RestController: tells Spring this class handles HTTP requests.
+    - @PostMapping("/api/mesh/upload"): binds POST requests to this method.
+    - Method receivePacket(@RequestBody MeshPacket packet):
+        Calls paymentProcessorService.processIncomingPacket(packet).
+        Returns "Transaction Processed and Settled Successfully!" on success.
+        Returns error message on failure with appropriate HTTP status.
+
+  PaymentProcessorService.java
+    - @Service: business logic layer.
+    - processIncomingPacket(MeshPacket packet):
+      1. checkReplayAttack() — SHA-256 hash of ciphertext already in DB?
+      2. checkUserExists() — senderVpa registered with a public key?
+      3. verifySignature() — RSA signature matches sender's public key?
+      4. decryptPayload() — RSA unwrap AES key, AES-GCM decrypt.
+      5. verifyVpaMatch() — outer senderVpa == inner senderVpa?
+      6. checkPacketFreshness() — signedAt within 24 hours?
+      7. processTransaction() — sufficient balance? transfer funds.
+      8. saveTransaction() — persist audit record, return SUCCESS.
+
+  HybridCryptoService.java
+    - decryptPayload(String ciphertext):
+      1. Split ciphertext into IV : EncryptedAESKey : EncryptedData.
+      2. RSA private key decrypts EncryptedAESKey → AES key.
+      3. AES key + IV decrypt EncryptedData → plaintext JSON.
+
+  SignatureService.java
+    - verifySignature(String data, String signatureB64, PublicKey key):
+      1. Base64-decode the signature.
+      2. Use SHA256withRSA to verify data against signature using sender's key.
+
+  LedgerService.java
+    - transferFunds(String senderVpa, String receiverVpa, BigDecimal amount):
+      Debit sender's account, credit receiver's account.
+      Throws if insufficient balance.
+
+  DataInitializer.java
+    - Runs on startup (implements CommandLineRunner).
+    - Generates bank's RSA key pair (stored in memory).
+    - Seeds demo accounts with initial balances.
+
+  Entity Classes:
+    - User: VPA + RSA public key (stored as byte array).
+    - Account: VPA + balance (BigDecimal).
+    - Transaction: packetHash + senderVpa + receiverVpa + amount + status +
+      timestamp.  Status: PENDING, SETTLED, REJECTED.
+
+  Model Classes:
+    - MeshPacket: packetId + ttl + createdAt + senderVpa + signature +
+      ciphertext.
+    - PaymentInstruction: senderVpa + receiverVpa + amount + pinHash + nonce +
+      signedAt.  This is the plaintext inside the ciphertext.
+
+Why H2 Database?
+  - In-memory: no external database server needed.  Simple for demos.
+  - SQL: standard query language, easy to inspect (H2 Console at /h2-console).
+  - JPA integration: Spring Boot's spring-boot-starter-data-jpa works with
+    H2 out of the box.
+
+Why Embedded Tomcat?
+  - Spring Boot packages Tomcat inside the JAR. No separate server install.
+  - docker run java -jar app.jar starts the entire server.
+
+Maven:
+  - Build tool for Java projects (like pip for Python or npm for Node.js).
+  - pom.xml defines dependencies, build plugins, Java version.
+  - mvn clean package compiles, runs tests, and packages into a JAR file.
+  - Our Dockerfile uses a multi-stage build:
+    Stage 1 (builder): maven:3.9.6 image, runs mvn package.
+    Stage 2 (runtime): eclipse-temurin:21-jre-alpine (small JRE only).
+    Only the JAR is copied to the final image (~200MB → ~80MB savings).
+
+
+================================================================================
+10. HYBRID ENCRYPTION (AES-256-GCM + RSA-OAEP)
+================================================================================
+
+What Is It?
+  A combination of symmetric encryption (AES) and asymmetric encryption (RSA)
+  to get the best of both: RSA's key exchange without key sharing, and AES's
+  speed for bulk data.
+
+Why Not Just RSA?
+  - RSA-2048 can only encrypt ~256 bytes (2048 bits) of data.
+  - A payment instruction JSON is typically 200-500 bytes — too large.
+  - RSA encryption is computationally expensive (~1000x slower than AES).
+
+Why Not Just AES?
+  - AES requires both parties to share the same secret key.
+  - Sharing a key securely over an untrusted network is the key distribution
+    problem that asymmetric cryptography solves.
+
+The Flow (Alice sends to Bank):
+  1. Bank generates RSA key pair (public + private).
+  2. Alice gets Bank's RSA public key (during provisioning).
+  3. Alice generates a random 32-byte (256-bit) AES key.
+  4. Alice encrypts her payment instruction with AES-256-GCM using that key.
+  5. Alice encrypts the AES key with Bank's RSA public key (OAEP padding).
+  6. Alice sends IV : EncryptedAESKey : Ciphertext to the mesh.
+  7. Bank receives it, decrypts the AES key with its RSA private key.
+  8. Bank decrypts the ciphertext with the AES key.
+
+Why AES-256-GCM?
+  - AES-256: 256-bit key. Brute-forcing 2^256 keys is impossible with current
+    or foreseeable technology.
+  - GCM (Galois/Counter Mode):
+    - Authenticated encryption: produces a 16-byte authentication tag.
+    - The tag detects any tampering with the ciphertext.
+    - Counter mode can be parallelized (faster than CBC).
+    - Requires a unique IV (12 bytes) for each encryption.
+
+Why RSA-OAEP?
+  - OAEP (Optimal Asymmetric Encryption Padding):
+    - Adds randomness: same plaintext encrypts to different ciphertexts each
+      time (even if the same AES key is encrypted twice, outputs differ).
+    - Prevents chosen-plaintext attacks.
+    - Includes a hash of label + padding in the encryption.
+  - MGF1 (Mask Generation Function 1):
+    - Used by OAEP to generate the padding mask.
+    - Our implementation uses SHA-256 for MGF1 (to match the Java server).
+    - Python's cryptography library defaults to SHA-1 for MGF1 — we had to
+      explicitly change it to SHA-256.
+
+The Ciphertext Format:
+  base64(IV) + ":" + base64(EncryptedAESKey) + ":" + base64(Ciphertext)
+  Example:
+    aBcDeF123456:GhIjKlMnOpQrStUvWxYz0123456789abcdef:ZyXwVuTsRqPoNmLkJiHgFeDcBa
+
+Key Sizes in Our Project:
+  - AES key: 256 bits (32 bytes).
+  - IV: 96 bits (12 bytes) — optimal for GCM.
+  - RSA key: 2048 bits (256 bytes) — industry standard.
+  - RSA ciphertext (encrypted AES key): 256 bytes (same as key size).
+
+Important Implementation Detail (Python side):
+  The alice_phone.py uses:
+    padding.OAEP(
+        mgf=padding.MGF1(algorithm=hashes.SHA256()),  # ← must match Java
+        algorithm=hashes.SHA256(),
+        label=None
+    )
+  The Java server uses RSA/ECB/OAEPWithSHA-256AndMGF1Padding.
+  If MGF1 uses SHA-1 (Python's default), the Java server cannot decrypt.
+  This was a bug we fixed: changed MGF1 from hashes.SHA1() to hashes.SHA256().
+
+
+================================================================================
+11. DIGITAL SIGNATURES (SHA256withRSA)
+================================================================================
+
+What Is It?
+  A cryptographic technique that proves:
+    - Authenticity: the packet was created by the claimed sender.
+    - Integrity: the packet was not modified in transit.
+    - Non-repudiation: the sender cannot deny sending it.
+
+Why Do We Need It?
+  Without a signature, an attacker could:
+    - Modify the payment amount from ₹500 to ₹5,000,000.
+    - Change the receiver from "bob@bank" to "attacker@bank".
+    - Forge a packet claiming to be from Alice.
+
+How Signing Works (Alice's Side):
+  1. Alice has her ciphertext (encrypted payment data).
+  2. She computes SHA-256 hash of the ciphertext:
+       hash = SHA256(ciphertext)
+  3. She encrypts the hash with her RSA private key:
+       signature = RSA_private_encrypt(hash)
+  4. The signature is base64-encoded and included in the MeshPacket.
+
+How Verification Works (Bank's Side):
+  1. Bank receives the MeshPacket with ciphertext + signature.
+  2. Bank looks up Alice's RSA public key (from provisioning).
+  3. Bank decrypts the signature to get the claimed hash:
+       claimed_hash = RSA_public_decrypt(signature)
+  4. Bank computes its own hash of the received ciphertext:
+       actual_hash = SHA256(ciphertext)
+  5. If claimed_hash == actual_hash: packet is authentic and untampered.
+  6. If they don't match: reject (tampered or forged).
+
+Why SHA-256?
+  - 256-bit output: collision resistance of 2^128 (birthday attack).
+  - No known practical collisions (unlike SHA-1, which has SHAttered attack).
+  - Widely supported in both Java and Python.
+
+Why PKCS#1 v1.5 Padding (not PSS)?
+  - PKCS#1 v1.5 is the older, simpler padding scheme for RSA signatures.
+  - PSS (Probabilistic Signature Scheme) is newer and more secure.
+  - PKCS#1 v1.5 is still considered secure for signatures (the vulnerabilities
+    only affect encryption, not signatures).
+  - Both Java and Python support it, so it's the simplest compatible option.
+
+Signature in the MeshPacket:
+  {
+    "packetId": "PKT_ABCD1234",
+    "signature": "base64encodedRSAsignature...",
+    "ciphertext": "IV:EncryptedKey:Ciphertext...",
+    ...
+  }
+  The signature covers the ciphertext, not the full MeshPacket JSON. This
+  means the packet metadata (TTL, packetId) can be modified by intermediate
+  nodes without breaking the signature. This is intentional: the bank only
+  cares that the encrypted payload (which only the bank can read) is authentic.
+
+
+================================================================================
+12. TTL (TIME TO LIVE)
+================================================================================
+
+What Is It?
+  A counter in the packet that decreases by 1 at every hop. When it reaches 0,
+  the packet is dropped.
+
+Why Do We Need It?
+  In a mesh network, packets could theoretically loop forever if:
+    - Routing has a cycle (A→B→C→A).
+    - Two nodes keep forwarding back to each other.
+    - A misconfigured topology creates infinite paths.
+  TTL provides an upper bound on packet lifetime.
+
+How It's Used in Our Project:
+  - Packets start with TTL = 10 (configured by the sender).
+  - Each node decrements TTL before forwarding.
+  - If TTL ≤ 0 on arrival, the node drops the packet and returns 400.
+  - The visualizer shows a DROPPED event.
+
+Why TTL = 10?
+  - Maximum greedy path from Node-1 to Bank is ~4 hops.
+  - TTL = 10 gives plenty of room for suboptimal paths or detours.
+  - In a real mesh with 50 nodes, TTL would be set based on network diameter.
+
+What Happens When TTL Expires?
+  - Node reports DROPPED to visualizer.
+  - Returns HTTP 400 with error "TTL Expired".
+  - Packet is discarded — the sender gets an error response.
+
+The Zombie Defense Metaphor:
+  A packet that should have died but keeps going is a "zombie." TTL is the
+  defense: it kills zombies before they consume network resources forever.
+
+TTL vs Packet Freshness:
+  - TTL: short-term, prevents loops in the mesh (seconds/minutes).
+  - Packet freshness (24-hour expiry): long-term, prevents replay of old
+    packets (hours/days).  These are complementary defenses.
+
+
+================================================================================
+13. REPLAY ATTACK PROTECTION
+================================================================================
+
+What Is a Replay Attack?
+  An attacker intercepts a valid payment packet and resends it later. If the
+  bank doesn't detect this, the payment is processed twice (or more).
+  Example: Alice pays Bob ₹500. Attacker captures the packet and sends it
+  again.  Bob gets ₹500 again, Alice's account is debited twice.
+
+How We Prevent It:
+  The bank computes SHA-256 of the ciphertext and stores it in the
+  transaction table with a UNIQUE constraint.
+
+  Flow:
+    1. Bank receives packet with ciphertext.
+    2. Compute hash = SHA-256(ciphertext).
+    3. Query: does this hash already exist in the transactions table?
+    4. Yes → reject with "Duplicate Packet Detected".
+    5. No → continue processing, save hash with new transaction.
+
+Why Can't the Attacker Just Modify the Ciphertext?
+  The attacker cannot read the ciphertext (it's encrypted). If they modify it
+  arbitrarily, two things happen:
+    - The RSA signature verification fails (signature covers ciphertext).
+    - AES-GCM decryption fails (authentication tag won't match).
+
+Why Can't the Attacker Just Generate a New Ciphertext?
+  The attacker doesn't have Alice's RSA private key, so they can't create a
+  valid signature for a new ciphertext.
+
+How Is the Hash Computed?
+  packetHash = SHA-256(cipherText)
+  The hash is on the raw Base64-decoded ciphertext bytes.
+
+Double Spend Prevention:
+  Even without replay, two identical payment instructions (same sender,
+  same amount, same receiver) would have different ciphertexts because:
+    - AES-GCM uses a fresh random IV for each encryption.
+    - RSA-OAEP uses random padding.
+  So the SHA-256 hashes would be different. The bank's balance check
+  (sufficientFunds) prevents double-spending at the account level.
+
+What Our Replay Check Actually Protects Against:
+  The case where an attacker captures the exact same encrypted packet
+  (with the same IV, same ciphertext, same signature) and replays it.
+
+
+================================================================================
+14. PACKET FRESHNESS (ZOMBIE DEFENSE)
+================================================================================
+
+What Is It?
+  A check that rejects packets older than 24 hours. Each payment instruction
+  includes a "signedAt" timestamp. The bank compares this to the current time.
+
+Why 24 Hours?
+  - Long enough to handle network delays and store-and-forward scenarios.
+  - Short enough to prevent old packets from being hoarded and replayed.
+  - Industry standard for financial transactions (EMV, UPI specs).
+
+How It Works:
+  1. Alice creates a PaymentInstruction with signedAt = current timestamp.
+  2. The bank decrypts the payload and extracts signedAt.
+  3. The bank checks: currentTime - signedAt > 24 hours?
+  4. Yes → reject as expired packet.
+  5. No → continue processing.
+
+Relation to TTL:
+  - TTL protects the mesh from loops (seconds/minutes timescale).
+  - Freshness protects the bank from old-packet replay (hours/days timescale).
+  - Two independent defenses for different attack vectors.
+
+What If Clocks Are Unsynchronized?
+  - In a real offline mesh, phones may not have accurate clocks.
+  - Solution: include a nonce + sequence number instead of relying solely on
+    timestamps.  Or use a grace period (e.g., 48 hours instead of 24).
+
+
+================================================================================
+15. PROVISIONING FLOW
+================================================================================
+
+What Is Provisioning?
+  The process of registering a user (VPA + public key) with the bank so they
+  can send and receive payments.  This is the "onboarding" step.
+
+Why Is It Necessary?
+  The bank needs to know:
+    - Who is Alice? (VPA → identity)
+    - How to verify her signature? (RSA public key)
+    - How much money does she have? (account balance)
+
+The Provisioning HTTP Request:
+  POST /api/mesh/provision
+  Body:
+  {
+    "vpa": "alice@bank",
+    "publicKey": "base64encodedDERpublicKey..."
+  }
+  Response:
+  {
+    "status": "Provisioned Successfully",
+    "vpa": "alice@bank",
+    "bankPublicKey": "base64encodedDERbankPublicKey..."
+  }
+
+Step-by-Step Flow:
+  1. Alice generates RSA key pair (if she doesn't have one already).
+  2. Alice extracts the public key and DER-encodes it.
+  3. Alice sends POST /api/mesh/provision with her VPA and public key.
+  4. Bank controller receives the request.
+  5. Bank creates a User record (VPA + public key bytes).
+  6. Bank creates an Account record (VPA + initial balance, e.g., ₹10,000).
+  7. Bank returns its own RSA public key (so Alice can encrypt to the bank).
+  8. Alice stores the bank's public key for future use.
+
+Why Does the Bank Return Its Public Key?
+  Alice needs the bank's public key to encrypt the AES key (hybrid encryption).
+  If the bank's key were hardcoded, it would break when the bank restarts
+  (because the bank generates a fresh key pair on every boot in this demo).
+
+Why Does Alice Generate Her Own Keys?
+  - Alice's private key never leaves her device → only she can sign packets.
+  - The bank only has Alice's public key → it can verify but not forge.
+  - This prevents the bank from impersonating Alice.
+
+What About Bob?
+  Bob also needs to be provisioned before Alice can send him money.  The bank
+  needs Bob's account to exist so it can credit the funds.
+  In our demo, alice_phone.py provisions both Alice and Bob.
+
+
+================================================================================
+16. DEDUP IN THE MESH
+================================================================================
+
+What Is It?
+  Duplicate detection within the mesh nodes (not the bank). If the same packet
+  arrives at a node twice (via different paths), the node should only forward
+  it once.
+
+Why Is This Needed?
+  In a mesh with multiple paths, a packet might arrive at the same node from
+  two different neighbors. Without dedup, the node would forward it twice,
+  creating unnecessary traffic and possibly loops.
+
+How It Works in Our Project (Briefly):
+  Each node maintains a Python set of processed packet IDs. When a packet
+  arrives:
+    - If packetId is in the set: silently drop it (return 200 without action).
+    - If packetId is not in the set: add it, process normally.
+
+Limitations of Our Implementation:
+  - In-memory set: lost if the container restarts.
+  - No TTL on entries: set grows unbounded over time.
+  - For a demo with a few packets, this is fine.
+  - For production: use a time-expiring cache (e.g., Redis, or a dict with
+    timestamps and periodic cleanup).
+
+Why Don't We See This in Action?
+  Our greedy routing always chooses the same path for a given source-destination
+  pair (deterministic).  Dedup would only trigger if:
+    - A node receives the same packet from two different neighbors.
+    - This could happen if we added random path selection or if a node
+      retransmits after a timeout.
+
+
+================================================================================
+17. VISUALIZER (Flask SSE Server)
+================================================================================
+
+What Is It?
+  A Python Flask server that collects "hop events" from all mesh nodes and
+  streams them to a browser using Server-Sent Events (SSE).  It also serves
+  the HTML dashboard.
+
+Why a Visualizer?
+  - Mesh routing is invisible: packets fly between Docker containers.
+  - The visualizer makes the routing visible and debuggable.
+  - It's a powerful demo tool: watch packets hop in real-time.
+  - Validates that the greedy routing is working as expected.
+
+Architecture:
+
+  ┌─────────┐  POST /hop  ┌──────────┐  SSE /events  ┌─────────┐
+  │ Node-1  │────────────▶│          │───────────────▶│ Browser │
+  │ Node-2  │────────────▶│ Flask    │                │ Canvas  │
+  │ Node-3  │────────────▶│ Server   │                │         │
+  │ ...     │────────────▶│          │                │         │
+  │ Bank    │────────────▶│ port 5002│                │         │
+  └─────────┘             └──────────┘                └─────────┘
+
+Key Endpoints:
+
+  GET /
+    Returns the HTML dashboard page. Embeds the topology JSON directly into
+    the page via Jinja2 template rendering.
+
+  POST /hop
+    Called by every node and the bank whenever something happens.
+    Body:
+    {
+      "node_id": "Node-5",
+      "packet_id": "PKT_ABCD1234",
+      "action": "FORWARDED",
+      "to_node": "Node-9",
+      "ttl": 7,
+      "message": "Node-5 → Node-9 (greedy)",
+      "timestamp": 1779527118174
+    }
+    The event is appended to a thread-safe list (hop_events) protected by a
+    threading.Lock.
+
+  GET /events
+    SSE endpoint. The browser opens a long-lived HTTP connection. The server
+    repeatedly checks the hop_events list and sends any new events as SSE data.
+    Uses a generator function that yields "data: {json}\n\n" strings.
+
+  POST /reset
+    Clears all hop events. Useful for starting fresh between demo runs.
+
+SSE Format:
+  data: {"node_id":"Node-5","action":"FORWARDED",...}\n\n
+
+Thread Safety:
+  The hop_events list is shared between the /hop handler (write) and the
+  /events generator (read). A threading.Lock ensures only one thread accesses
+  the list at a time.  The lock is held briefly — just to append (write) or
+  copy the unread portion (read).
+
+Why SSE Instead of WebSockets?
+  - SSE is simpler: unidirectional (server → client), which is all we need.
+  - SSE works over standard HTTP (no upgrade handshake).
+  - SSE has automatic reconnection (built into EventSource API).
+  - WebSockets would be overkill for this use case.
+
+Why Flask Instead of Something Faster?
+  - Consistency: the mesh nodes also use Flask.
+  - Simplicity: the visualizer has very low traffic (a few events per second).
+  - For a demo, performance is not a concern.
+
+
+================================================================================
+18. HTML5 CANVAS DASHBOARD
+================================================================================
+
+What Is It?
+  A single HTML page (dashboard.html) that renders the mesh topology as an
+  interactive visualization using the HTML5 Canvas 2D API.  It connects to the
+  SSE endpoint and animates packets in real-time.
+
+How It Works:
+
+  1. Page Load:
+    - The Flask server renders dashboard.html with topology JSON embedded.
+    - JavaScript normalizes node positions to a 0-1 range for responsive layout.
+    - The canvas is sized to fill the viewport.
+
+  2. SSE Connection:
+    - const eventSource = new EventSource('/events');
+    - onmessage callback: parse JSON, call processEvent().
+    - onopen: update status indicator to "Connected" (green dot).
+    - onerror: update to "Disconnected" (red dot), auto-reconnect after 2s.
+
+  3. Event Processing (processEvent):
+    - RECEIVED: add node to activeNodes set, start pulse animation.
+    - FORWARDED: create a MovingPacket from this node to to_node.
+    - DROPPED: start error pulse animation.
+    - SETTLED: mark node as settled (purple glow).
+    - REJECTED: start error pulse animation.
+    - All events: add log entry to the side panel.
+
+  4. Render Loop (render):
+    - requestAnimationFrame loop at ~60fps.
+    - Clear canvas.
+    - Draw background (dark gradient + grid lines).
+    - Draw edges (solid for connections, dashed for diagonals).
+    - Draw moving packets (lerp between node positions, glow trail).
+    - Draw nodes (gradient fill, pulse animation, status colors).
+
+  5. Node Drawing:
+    - Active nodes: green glow, pulsing ring.
+    - Settled nodes: purple (bank has processed).
+    - Error nodes: red glow.
+    - Inactive nodes: dark, subtle border.
+    - Each node shows an icon (📱 for phones, 🏦 for bank) and label.
+
+  6. Packet Animation:
+    - Each MovingPacket has fromNode, toNode, progress (0 → 1).
+    - Speed: ~0.006 per frame → takes ~167 frames ≈ 2.8 seconds per hop.
+    - Position: lerp(fromPos, toPos, progress).
+    - Trail: stores last 18 positions, draws them with decreasing opacity.
+    - Glow: radial gradient around the packet position.
+
+  7. Edge Drawing:
+    - Edges that have been traversed: green glow.
+    - Regular edges: dark solid line.
+    - Diagonal edges: dashed line (visual distinction).
+
+  8. Log Panel:
+    - Right side panel shows a scrollable list of events.
+    - Each entry: timestamp, node tag (blue for phones, purple for bank),
+      action label (green RECEIVED, blue FORWARDED, red DROPPED, etc.),
+      message text.
+    - Color-coded left border matches action type.
+
+Canvas vs DOM-based Visualization:
+  - Canvas: pixel-based, redraws entire scene every frame. Better for many
+    elements and smooth animations.
+  - DOM (SVG, divs): element-based, browser manages layout. Better for
+    interactivity (clicking, hovering).
+  - We chose Canvas because we primarily need smooth animation, not interaction.
+
+Key Canvas API Calls Used:
+  - ctx.createRadialGradient() — for node fills and glow effects.
+  - ctx.arc() — draw circular nodes.
+  - ctx.beginPath(), ctx.moveTo(), ctx.lineTo() — draw edges.
+  - ctx.fillText() — draw node labels.
+  - ctx.shadowColor / ctx.shadowBlur — glow effects.
+  - ctx.setLineDash() — dashed lines for diagonal connections.
+  - ctx.clearRect() — clear canvas each frame.
+  - requestAnimationFrame() — synchronize with display refresh rate.
+
+
+================================================================================
+19. DATA FLOW END-TO-END
+================================================================================
+
+This section traces a single payment from Alice's laptop through the mesh to
+the bank, and back.
+
+Step 1: Alice's Laptop (alice_phone.py)
+
+  1.1 Load or generate Alice's RSA-2048 key pair.
+  1.2 Provision Alice: POST /api/mesh/provision with VPA + public key.
+      Bank creates User + Account, returns bank's public key.
+  1.3 Provision Bob: same endpoint (so Bob's account exists).
+  1.4 Build PaymentInstruction:
+      { senderVpa, receiverVpa, amount, pinHash, nonce, signedAt }
+  1.5 Encrypt with hybrid encryption:
+      - Generate random AES-256 key.
+      - AES-256-GCM encrypt the PaymentInstruction → ciphertext.
+      - RSA-OAEP encrypt the AES key with bank's public key.
+      - Format: IV:EncryptedKey:EncryptedData (all base64).
+  1.6 Sign the ciphertext with Alice's private key → signature (base64).
+  1.7 Assemble MeshPacket:
+      { packetId, ttl: 10, createdAt, senderVpa, signature, ciphertext }
+  1.8 POST to http://localhost:5001/receive (Node-1).
+
+Step 2: Mesh Routing (Node-5 as example)
+
+  2.1 Node-5 receives packet (from Node-1).
+  2.2 Reports RECEIVED to visualizer.
+  2.3 Checks TTL > 0 (yes — 8 after previous hops).
+  2.4 Decrements TTL → 7.
+  2.5 Calls best_gateway():
+      - Check each neighbor's position in mesh-topology.json.
+      - Compute distance from each neighbor to Bank.
+      - Pick the one with smallest distance.
+      - Result: Node-9 (distance to Bank ≈ 180).
+  2.6 Records routing decision in history.
+  2.7 Reports FORWARDED to visualizer (with to_node: "Node-9").
+  2.8 POST to http://node-9:5001/receive with updated packet.
+  2.9 Receives response from Node-9 (which includes bank's response).
+  2.10 Returns nested response to Node-1.
+
+Step 3: Gateway Node (Node-10)
+
+  3.1 Receives packet from Node-9.
+  3.2 Neighbors: Node-9 and Bank.
+  3.3 best_gateway(): Bank has distance 0 — picks Bank.
+  3.4 Since target == "Bank", uses gateway path:
+      - POST to http://spring-bank:8080/api/mesh/upload (not .../receive).
+      - Reports FORWARDED to visualizer with to_node: "Bank".
+  3.5 Receives response from Bank.
+
+Step 4: Bank Server (Spring Boot)
+
+  4.1 PaymentController receives POST /api/mesh/upload.
+  4.2 Calls PaymentProcessorService.processIncomingPacket().
+
+  Check 1 — Replay:
+    SHA-256(ciphertext) → query transactions by packetHash.
+    If found → throw SecurityException("Duplicate Packet Detected").
+
+  Check 2 — User Exists:
+    Query users by senderVpa.
+    If not found → throw SecurityException("Sender VPA not found").
+
+  Check 3 — Signature Verification:
+    SignatureService.verifySignature(ciphertext, signature, user.publicKey).
+    If false → throw SecurityException("Signature Verification Failed").
+
+  Check 4 — Decrypt Payload:
+    HybridCryptoService.decryptPayload(ciphertext):
+      - Split by ":" → IV, encryptedKey, encryptedData.
+      - RSA private key decrypt → AES key.
+      - AES-256-GCM decrypt → plaintext JSON.
+      - Parse JSON → PaymentInstruction.
+
+  Check 5 — VPA Match:
+    Compare packet.senderVpa with paymentInstruction.senderVpa.
+    If mismatch → throw SecurityException("VPA Mismatch").
+
+  Check 6 — Packet Freshness:
+    signedAt within 24 hours of current time?
+    If expired → throw SecurityException("Packet Expired").
+
+  Check 7 — Process Transaction:
+    LedgerService.transferFunds(sender, receiver, amount):
+      - Find sender's Account.
+      - Find receiver's Account.
+      - Check sender.balance >= amount.
+      - Debit sender, credit receiver.
+
+  Check 8 — Save Transaction:
+    TransactionRepository.save():
+      - Persist Transaction with status SETTLED.
+      - Includes: packetHash, senderVpa, receiverVpa, amount, timestamp.
+
+  4.3 Return 200 OK: "Transaction Processed and Settled Successfully!".
+
+Step 5: Response Propagation
+
+  The response propagates back through the mesh:
+    Bank → Node-10: "Transaction Processed and Settled Successfully!"
+    Node-10 → Node-9: { status: "Forwarded by Node-10 to Bank",
+                         downstream_response: "Transaction..." }
+    Node-9 → Node-5: { status: "Forwarded by Node-9 to Node-10",
+                        greedy_choice: "Node-10",
+                        downstream_response: {...} }
+    Node-5 → Node-1: { status: "Forwarded by Node-5 to Node-9",
+                        greedy_choice: "Node-9",
+                        downstream_response: {...} }
+    Node-1 → Alice: { status: "Forwarded by Node-1 to Node-5",
+                       greedy_choice: "Node-5",
+                       downstream_response: {...} }
+
+Step 6: Visualizer Events (Parallel, Fire-and-Forget)
+
+  During the entire flow, each node independently reports events:
+    Node-1: RECEIVED, FORWARDED
+    Node-5: RECEIVED, FORWARDED
+    Node-9: RECEIVED, FORWARDED
+    Node-10: RECEIVED, FORWARDED
+    Bank: RECEIVED, SETTLED (or REJECTED)
+
+  The browser receives these via SSE and animates them on the canvas.
+
+
+================================================================================
+20. DESIGN PATTERNS USED
+================================================================================
+
+20.1 Model-View-Controller (MVC)
+
+  Where: Spring Boot bank server.
+
+  - Model: Entity classes (User, Account, Transaction, MeshPacket,
+    PaymentInstruction).  Represent data and business rules.
+  - View: JSON responses returned by controllers.  Also the HTML dashboard
+    served by the visualizer.
+  - Controller: PaymentController, TestProvisionController.  Handle HTTP
+    requests, parse input, delegate to services, format responses.
+
+  Why: Separation of concerns.  Controllers handle HTTP; services handle
+  business logic; entities handle data.  Each can change independently.
+
+20.2 Service Layer
+
+  Where: PaymentProcessorService, HybridCryptoService, SignatureService,
+  LedgerService.
+
+  - Encapsulates business logic in @Service-annotated classes.
+  - Controllers are thin: validate input, call service, return result.
+  - Services can be reused by multiple controllers.
+  - Services can be tested independently (unit tests with mocked dependencies).
+
+20.3 Dependency Injection
+
+  Where: Spring Boot @Autowired annotations.
+
+  - Spring automatically creates instances of @Service, @Repository classes.
+  - @Autowired injects them where needed (controller, other services).
+  - Example:
+      @Autowired
+      private PaymentProcessorService paymentProcessorService;
+  - Makes testing easy: replace real services with @MockBean in tests.
+
+20.4 Template Method (Pipeline Pattern)
+
+  Where: PaymentProcessorService.processIncomingPacket().
+
+  - A series of 8 steps executed in fixed order.
+  - Each step is a separate method that can reject the packet.
+  - Steps are independent and can be rearranged, added, or removed.
+  - The calling code doesn't change when steps change.
+
+20.5 Observer Pattern
+
+  Where: Visualizer SSE system.
+
+  - Subject: Mesh nodes (they generate events).
+  - Observer: Browser (it receives and displays events).
+  - Visualizer acts as the event channel (mediator).
+  - Loose coupling: nodes don't know about browsers, browsers don't know about
+    nodes.
+
+20.6 Chain of Responsibility
+
+  Where: Mesh routing (each node forwards to the next).
+
+  - A packet passes through a chain of handlers (nodes).
+  - Each handler either processes the packet or forwards it.
+  - No central coordinator: each node makes its own decision.
+
+20.7 Nested Response (Composite-like)
+
+  Where: Mesh forwarding responses.
+
+  - Each node wraps the downstream response with its own status.
+  - The client receives a nested JSON structure showing the entire path.
+  - Like Russian nesting dolls: each layer reveals the next.
+
+20.8 Fire-and-Forget
+
+  Where: Visualizer reporting.
+
+  - Nodes send POST /hop and don't wait for the response.
+  - Failure is silently ignored (try/except pass).
+  - The mesh works without the visualizer.
+
+20.9 Singleton
+
+  Where: Python modules (routing_history list, hop_events list).
+
+  - Module-level variables in Python are effectively singletons.
+  - All requests to the same Flask app share the same list.
+  - Protected by threading.Lock for thread safety.
+
+
+================================================================================
+21. JAVA CONCEPTS USED
+================================================================================
+
+21.1 Annotations
+
+  @SpringBootApplication
+    - Combines @Configuration, @EnableAutoConfiguration, @ComponentScan.
+    - Entry point for Spring Boot apps.
+
+  @RestController
+    - Marks class as a REST controller (handles HTTP, returns JSON).
+    - Combines @Controller + @ResponseBody.
+
+  @RequestMapping("/api/mesh") and @PostMapping("/upload")
+    - Maps HTTP POST /api/mesh/upload to a Java method.
+
+  @Service
+    - Marks class as business logic service (Spring-managed bean).
+
+  @Autowired
+    - Injects dependencies automatically.
+
+  @Entity
+    - Marks class as a JPA entity (maps to database table).
+
+  @Table(name = "users"), @Column(nullable = false), @Id, @GeneratedValue
+    - JPA annotations for database mapping.
+
+21.2 JPA (Java Persistence API)
+
+  - ORM (Object-Relational Mapping): maps Java objects to database tables.
+  - @Entity classes become tables.
+  - JpaRepository<Transaction, Long> provides CRUD operations.
+  - findByVpa(), existsByPacketHash() — Spring Data generates queries from
+    method names.
+
+21.3 Exception Handling
+
+  - PaymentProcessorService throws SecurityException for security failures.
+  - PaymentController catches exceptions and maps to appropriate HTTP status:
+      SecurityException → 403 Forbidden
+      RuntimeException → 500 Internal Server Error
+  - This keeps error handling centralized.
+
+21.4 Java Cryptography Architecture (JCA/JCE)
+
+  - Cipher class: Cipher.getInstance("AES/GCM/NoPadding")
+  - KeyGenerator: KeyGenerator.getInstance("AES")
+  - KeyPairGenerator: KeyPairGenerator.getInstance("RSA")
+  - Signature: Signature.getInstance("SHA256withRSA")
+
+21.5 BigDecimal
+
+  - Used for monetary amounts (not double/float).
+  - float and double have precision issues with decimal fractions.
+  - BigDecimal represents exact decimal values (e.g., 500.00).
+
+21.6 Optional<T>
+
+  - userRepository.findByVpa() returns Optional<User>.
+  - Forces the caller to handle the "not found" case.
+  - Prevents NullPointerException.
+
+21.7 Streams and Lambdas
+
+  - Java 8+ functional programming features.
+  - Optional.map(), Optional.orElseThrow().
+  - Repository.findAll().stream()...
+
+21.8 Multi-stage Docker Build
+
+  - Stage 1 (builder): fat Maven image, compiles code.
+  - Stage 2 (runtime): slim JRE image, only contains the JAR.
+  - Result: smaller final image (~200MB → ~80MB savings).
+
+
+================================================================================
+22. PYTHON CONCEPTS USED
+================================================================================
+
+22.1 Flask
+
+  - Web framework: decorator-based routing.
+  - @app.route('/path', methods=['POST'])
+  - request.json — parsed JSON body.
+  - jsonify() — return JSON response.
+  - Flask's built-in server is WSGI (single-threaded, synchronous).
+
+22.2 Requests Library
+
+  - HTTP client for Python.
+  - requests.post(url, json=data, timeout=15)
+  - .json() — parse JSON response.
+  - .ok — boolean for 2xx status.
+  - .status_code — HTTP status code.
+
+22.3 Threading and Locks
+
+  - threading.Lock protects hop_events list from concurrent access.
+  - with lock: — acquires and releases lock automatically.
+  - Prevents race conditions when /hop and /events run simultaneously.
+
+22.4 Generators (SSE)
+
+  - def generate(): while True: yield f"data: {json}\n\n"
+  - Flask wraps the generator in a Response with stream=True.
+  - The browser receives events as they're yielded.
+
+22.5 Exception Handling (try/except)
+
+  - try: requests.post(...) except: pass
+  - Fire-and-forget pattern: don't let visualizer failures crash the node.
+
+22.6 JSON Serialization
+
+  - json.load(f) — parse JSON file into Python dict.
+  - json.dumps(data) — serialize dict to JSON string.
+  - json.dump(data, f, indent=2) — pretty-print to file.
+
+22.7 Math (sqrt, pow)
+
+  - math.sqrt((a-b)**2 + (c-d)**2) — Euclidean distance.
+  - ** is Python's power operator.
+
+22.8 Environment Variables (os.environ)
+
+  - NODE_ID = os.environ.get("NODE_ID", "Unknown-Phone")
+  - VISUALIZER_URL = os.environ.get("VISUALIZER_URL")
+  - Environment variables are set by Docker Compose.
+
+22.9 Module-level State
+
+  - routing_history = [] — shared across all requests.
+  - Since Flask's dev server is single-threaded by default, this works fine.
+  - In production with multiple workers, this would need a database or shared
+    memory.
+
+22.10 Pycryptodome / Cryptography Library
+
+  - from cryptography.hazmat.primitives.asymmetric import rsa, padding
+  - from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+  - AESGCM(aes_key).encrypt(iv, data, None) — encrypt with GCM.
+  - public_key.encrypt(aes_key, padding.OAEP(...)) — RSA-OAEP.
+
+
+================================================================================
+23. GLOSSARY
+================================================================================
+
+  AES      - Advanced Encryption Standard. Symmetric cipher used for bulk data
+             encryption.  Our project uses AES-256 (256-bit key).
+
+  AES-GCM  - Galois/Counter Mode. AES mode that provides both encryption and
+             integrity verification (authentication tag).
+
+  ASGI     - Asynchronous Server Gateway Interface. Python standard for async
+             web servers (Uvicorn, Daphne).  Alternative to WSGI.
+
+  BLE      - Bluetooth Low Energy. Wireless PAN technology, suitable for
+             short-range phone-to-phone communication in offline meshes.
+
+  Canvas   - HTML5 element for 2D drawing via JavaScript.  Used for the
+             visualizer dashboard.
+
+  CI/CD    - Continuous Integration / Continuous Deployment.  Automated
+             testing and deployment pipeline.
+
+  DER      - Distinguished Encoding Rules. Binary encoding format for X.509
+             certificates and public keys.
+
+  Docker   - Container runtime. Packages applications with dependencies into
+             isolated containers.
+
+  GCM      - See AES-GCM.
+
+  Greedy   - Algorithm that makes the locally optimal choice at each step
+  Routing  without considering the global path.
+
+  H2       - In-memory Java SQL database. Used by the bank server for demo
+             data storage.
+
+  HMAC     - Hash-based Message Authentication Code. Verifies integrity and
+             authenticity of a message using a shared secret.
+
+  HSM      - Hardware Security Module. Dedicated hardware for secure key
+             storage and crypto operations.
+
+  HTTP     - Hypertext Transfer Protocol.  Our mesh uses HTTP for all
+             inter-node communication.
+
+  IV       - Initialization Vector. Random bytes used to initialize AES-GCM.
+             Must be unique per encryption with the same key.
+
+  JAR      - Java Archive.  Packaged Java application (like a .zip for Java).
+
+  JCE      - Java Cryptography Extension.  Provides cryptographic APIs in
+             Java.
+
+  JPA      - Java Persistence API.  ORM standard for mapping Java objects to
+             database tables.
+
+  JRE      - Java Runtime Environment.  Required to run Java applications
+             (without compiler).
+
+  JDK      - Java Development Kit.  Includes JRE + compiler + tools.
+
+  LoRa     - Long Range radio. Low-power, long-distance wireless technology
+             for IoT and mesh networks.
+
+  Maven    - Build automation tool for Java.  Manages dependencies, compiles,
+             tests, packages.
+
+  MGF1     - Mask Generation Function 1.  Used by OAEP padding to generate
+             the encryption mask.
+
+  OAEP     - Optimal Asymmetric Encryption Padding.  RSA padding scheme that
+             adds randomness and prevents chosen-plaintext attacks.
+
+  ORM      - Object-Relational Mapping.  Maps database tables to programming
+             language objects.
+
+  PKCS#1   - Public Key Cryptography Standard #1.  Defines RSA encryption and
+  v1.5       signature padding schemes.
+
+  RSA      - Rivest-Shamir-Adleman.  Asymmetric cryptosystem (public/private
+             key pair).
+
+  SSE      - Server-Sent Events.  HTTP standard for server-to-client push
+             notifications.
+
+  TTL      - Time To Live.  Hop counter that prevents infinite packet loops.
+
+  UPI      - Unified Payments Interface.  Indian real-time payment system.
+
+  VPA      - Virtual Payment Address.  UPI identifier (like "alice@bank").
+
+  WSGI     - Web Server Gateway Interface.  Python standard for synchronous
+             web servers.
+
+  WiFi     - WiFi Direct.  Peer-to-peer WiFi standard for direct device-to-
+  Direct     device communication without an access point.
+
+
+================================================================================
+24. INTERVIEW QUESTIONS & ANSWERS
+================================================================================
+
+Q1: Why hybrid encryption instead of just RSA?
+A1: RSA-2048 can only encrypt ~256 bytes (key size). A payment instruction is
+    typically larger. Also, RSA is ~1000x slower than AES for bulk data.
+    Hybrid: AES encrypts the payload (fast, any size), RSA encrypts the AES
+    key (small, secure key exchange).
+
+Q2: How does greedy routing handle a "local minimum"?
+A2: A local minimum is when all neighbors are further from the destination
+    than the current node, but the current node is not the destination. Our
+    grid topology with diagonal connections avoids this. In real-world meshes,
+    you'd add "face routing" as a fallback: traverse the perimeter of the
+    void until you find a node closer to the destination.
+
+Q3: What is the difference between TTL and packet freshness?
+A3: TTL prevents infinite loops in the mesh (seconds/minutes scale). It's
+    decremented at each hop. Packet freshness (24-hour expiry) prevents
+    old-packet replay (hours/days scale). They are complementary defenses.
+
+Q4: How do we prevent replay attacks?
+A4: The bank computes SHA-256(ciphertext) and stores it with a UNIQUE
+    constraint. If the same ciphertext arrives again, the hash matches →
+    rejected. Even the same payment re-encrypted produces different ciphertext
+    (AES-GCM uses a random IV, RSA-OAEP uses random padding).
+
+Q5: Why does the bank generate a new RSA keypair on every boot?
+A5: Simplicity — no key persistence needed for the demo. In production, keys
+    would be stored securely (HSM, encrypted file, vault). The downside is
+    that all clients must re-provision after a bank restart.
+
+Q6: Why does the visualizer use SSE instead of WebSockets?
+A6: SSE is simpler (pure HTTP, no upgrade handshake) and sufficient for our
+    use case (unidirectional server→client). SSE also has automatic
+    reconnection built into the browser's EventSource API.
+
+Q7: What would you change for a production system?
+A7: See section 25 below.
+
+Q8: How does the nested response work?
+A8: Each node wraps the downstream response in its own JSON envelope:
+    Node-1: { status: "Forwarded by Node-1", greedy_choice: "Node-5",
+              downstream_response: Node-5's response }
+    This creates a chain showing the full path the packet took.
+
+Q9: Why Flask for mesh nodes instead of something faster?
+A9: Flask is simple, well-known, and adequate for a 10-node demo. Each node
+    handles one packet at a time (single-threaded). For production, you'd
+    switch to async (FastAPI + Uvicorn) or a compiled language (Rust, Go).
+
+Q10: How does provisioning work?
+A10: Alice generates RSA keys, sends her public key to the bank via
+     POST /api/mesh/provision. The bank stores it with her VPA, creates an
+     account, and returns its own public key. Now Alice can encrypt payments
+     to the bank and the bank can verify Alice's signature.
+
+Q11: What's in the ciphertext format?
+A11: base64(IV) + ":" + base64(EncryptedAESKey) + ":" + base64(Ciphertext).
+     The IV is 12 bytes (96 bits). The encrypted AES key is 256 bytes
+     (RSA-2048 output). The ciphertext is the AES-GCM encrypted payment
+     instruction.
+
+Q12: Why does MGF1 use SHA-256 instead of SHA-1?
+A12: The Java server uses "RSA/ECB/OAEPWithSHA-256AndMGF1Padding", which
+     means MGF1 uses SHA-256. Python's cryptography library defaults MGF1 to
+     SHA-1. If they don't match, decryption fails. We explicitly set MGF1 to
+     SHA-256 to match the Java server.
+
+Q13: How does the visualizer handle concurrency?
+A13: The hop_events list is protected by threading.Lock. The /hop endpoint
+     acquires the lock to append; the SSE generator acquires it to iterate.
+     Lock scope is minimal (just the list operation), so contention is low.
+
+Q14: Can the mesh work without the visualizer?
+A14: Yes. The visualizer is fire-and-forget reporting. If the visualizer is
+     down, every node's POST /hop fails silently (try/except pass). The mesh
+     routing works independently.
+
+Q15: What happens if a node crashes while holding a packet?
+A15: Currently, the HTTP request to the crashed node times out, and the
+     caller returns a 500 error. There's no store-and-forward. In production,
+     you'd add retry logic, fallback to the next-best neighbor, and
+     store-and-forward for disconnected periods.
+
+
+================================================================================
+25. CHANGES NEEDED FOR REAL-TIME OFFLINE MESH
+================================================================================
+
+This section covers every change required to make this project work in a
+real-world offline environment (phones communicating without internet).
+
+25.1 TRANSPORT LAYER
+
+  Current: HTTP/TCP over Docker bridge network.
+    - TCP is connection-oriented, reliable, in-order.
+    - HTTP adds headers and handshake overhead.
+    - Works great on a local machine with stable connectivity.
+
+  Real-world: UDP, Bluetooth LE, WiFi Direct, LoRa.
+    - No guarantee of delivery — must handle packet loss.
+    - Much lower bandwidth (LoRa: ~250 bps, BLE: ~1 Mbps).
+    - Connectionless — no handshake overhead.
+    - Packets may arrive out of order or not at all.
+
+  Impact on code:
+    - Rewrite node.py to use raw sockets (UDP) or platform-specific BLE APIs.
+    - Add sequence numbers + acknowledgment + retransmission.
+    - Implement fragmentation for large packets over low-MTU links.
+
+25.2 SERVER MODEL
+
+  Current: Flask (WSGI, synchronous, single-threaded).
+    - One request blocks the entire process.
+    - Can't handle concurrent packets efficiently.
+
+  Real-world: ASGI (Uvicorn/FastAPI) or event-driven (asyncio).
+    - Async I/O: handle hundreds of concurrent connections.
+    - Non-blocking: send/receive while waiting for other operations.
+
+  Impact on code:
+    - Rewrite node.py with asyncio + aiohttp for async HTTP (or raw UDP).
+    - Use asyncio.wait_for() for timeouts without blocking.
+    - Event loop handles multiple simultaneous packet flows.
+
+25.3 NODE DISCOVERY
+
+  Current: Static mesh-topology.json.
+    - Every node knows every other node's address and position.
+    - Changing topology requires editing a file and restarting containers.
+
+  Real-world: Dynamic discovery via periodic beacons/probes.
+    - Each phone broadcasts "I'm here" packets (containing node ID + position
+      + battery + queue depth).
+    - Phones build neighbor tables from received beacons.
+    - Lost beacons = neighbor timed out and removed.
+
+  Impact on code:
+    - Add a background thread/task that broadcasts beacons every N seconds.
+    - Add a beacon receiver that updates the neighbor table.
+    - Routing decisions now use the dynamic neighbor table.
+
+25.4 FAILURE HANDLING
+
+  Current: Fail → return 500 error, packet lost.
+    - If the chosen neighbor is unreachable, the packet dies.
+
+  Real-world: Retry + fallback + store-and-forward.
+    - If the best neighbor is unreachable, try the next-best.
+    - If all neighbors are unreachable, store the packet and retry later.
+    - Exponential backoff: 1s, 2s, 4s, 8s... between retries.
+
+  Impact on code:
+    - Change best_gateway() to return a SORTED list (closest → farthest).
+    - Loop through the list: try POST, on failure try next.
+    - Add a packet queue: if no neighbor is reachable, queue the packet.
+    - Background thread periodically retries queued packets.
+    - Discard packets that exceed max_retry_count or max_queue_time.
+
+25.5 CONGESTION CONTROL
+
+  Current: None — all packets converge on the best path greedily.
+    - If many packets enter the mesh, they all take the same greedy path.
+    - The nodes on that path get overloaded.
+
+  Real-world: Load-aware routing.
+    - Include queue depth, CPU load, battery level in routing decisions.
+    - Factor = distance_to_bank + penalty_for_congestion.
+    - Spread load across multiple paths.
+
+  Impact on code:
+    - Track per-neighbor metrics: queue depth, recent packet count, latency.
+    - Modify best_gateway() to include congestion penalty.
+    - E.g., chosen_dist = raw_dist + (queue_depth * weight).
+
+25.6 ACKNOWLEDGMENTS
+
+  Current: HTTP response = implicit acknowledgment.
+    - The calling node waits for the HTTP response.
+    - If the response doesn't arrive, the packet is lost.
+
+  Real-world: Explicit ACK with retransmission.
+    - Each packet has a unique ID.
+    - Receiver sends an ACK packet back to sender.
+    - If ACK doesn't arrive within timeout, sender retransmits.
+    - Dedup on the receiver prevents duplicate processing.
+
+  Impact on code:
+    - Implement a reliable transport layer on top of UDP.
+    - Packet format: { seq_num, ack_num, flags, payload }.
+    - Sender maintains a send buffer + retransmission timer.
+    - Receiver maintains a receive buffer + dedup window.
+
+25.7 BATTERY AWARENESS
+
+  Current: All nodes always on, always listening.
+    - In a real mesh, phones have limited battery.
+
+  Real-world: Duty cycling + wake-on-radio.
+    - Phones sleep most of the time, wake periodically to check for packets.
+    - Route around low-battery nodes.
+    - Don't forward for others if battery is critically low.
+
+25.8 PERSISTENT STORAGE
+
+  Current: In-memory state (lost on restart).
+    - Routing history, dedup set, queues — all in RAM.
+
+  Real-world: Persistent storage (SQLite, file system).
+    - Store-and-forward queue survives reboot.
+    - Dedup set survives reboot (important for preventing replay after crash).
+    - Routing history for debugging.
+
+25.9 CRYPTOGRAPHIC CONSIDERATIONS
+
+  Current: Works, but assumes reliable key distribution.
+    - Users must provision before sending payments.
+    - Bank's public key fetched once at provisioning time.
+
+  Real-world additional concerns:
+    - Key rotation: bank's key changes periodically, clients need updated key.
+    - Certificate chain: trust anchor for key verification.
+    - Perfect forward secrecy: ephemeral key exchange (not just RSA key wrap).
+
+25.10 SCALABILITY
+
+  Current: 10 nodes, all on one machine.
+    - O(n) routing decision per hop for n neighbors.
+
+  Real-world: 50-200+ nodes, spanning multiple geographic locations.
+    - Hierarchical routing: cluster heads reduce routing table size.
+    - Geographic partitioning: route toward a region, not a specific node.
+    - Greedy still works but needs face-routing fallback for voids.
+    - TTL needs to scale with network diameter (10 → 50+).
+
+25.11 SECURITY ENHANCEMENTS
+
+  Current: Encryption + signature per packet.
+    - Adequate for payment data.
+
+  Real-world additional threats:
+    - Sybil attack: attacker creates many fake nodes to control routing.
+    - Eclipse attack: attacker surrounds a victim with malicious nodes.
+    - Wormhole attack: attacker tunnels packets to bypass the mesh.
+    - Mitigation: identity verification, trust scores, redundant paths.
+
+25.12 SUMMARY TABLE
+
+  Area              | Current                          | Real-time Offline
+  ------------------|----------------------------------|----------------------
+  Transport         | HTTP/TCP                         | UDP / BLE / LoRa
+  Server model      | Flask (sync)                     | ASGI / asyncio
+  Node discovery    | Static config file               | Dynamic beacons
+  Failure handling  | Return 500, packet lost          | Retry + fallback + S&F
+  Congestion        | None                             | Load-aware routing
+  ACKs              | HTTP response (implicit)         | Explicit ACK + retransmit
+  Battery           | Always on                        | Duty cycling
+  Storage           | In-memory                        | Persistent (SQLite)
+  Key distribution  | Static provisioning              | Dynamic key rotation
+  Scalability       | 10 nodes                         | 50-200+ nodes
+  Routing fallback  | None                             | Face routing for voids
+  Mesh security     | None                             | Sybil/eclipse/wormhole protection
+
+
+================================================================================
+                  END OF COMPREHENSIVE GUIDE
+================================================================================

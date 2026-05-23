@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>UPI Mesh Visualizer</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{
+  background:#0a0e17;
+  color:#e0e0e0;
+  font-family:'SF Mono','Fira Code','Courier New',monospace;
+  height:100vh;overflow:hidden;
+  user-select:none;
+}
+#header{
+  height:52px;
+  display:flex;align-items:center;justify-content:space-between;
+  padding:0 24px;
+  background:rgba(13,17,23,0.95);
+  border-bottom:1px solid #1e2a3a;
+}
+#header .left{display:flex;align-items:center;gap:14px}
+#header h1{font-size:15px;font-weight:500;letter-spacing:0.3px}
+#header h1 span{color:#00ff88}
+#status{font-size:12px;color:#8b949e;display:flex;align-items:center;gap:6px}
+#status .dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+#status .dot.green{background:#00ff88;box-shadow:0 0 8px #00ff8844}
+#status .dot.red{background:#f85149;box-shadow:0 0 8px #f8514944}
+.reset-btn{
+  background:transparent;border:1px solid #1e2a3a;color:#8b949e;
+  padding:6px 14px;border-radius:4px;cursor:pointer;font-size:11px;
+  font-family:inherit;transition:all .2s;
+}
+.reset-btn:hover{background:#161b22;color:#e6edf3;border-color:#30363d}
+#main{display:flex;height:calc(100vh - 52px)}
+#canvas-container{flex:1;position:relative;min-width:0}
+#meshCanvas{width:100%;height:100%;display:block}
+#log-panel{
+  width:340px;min-width:340px;
+  background:rgba(13,17,23,0.9);
+  border-left:1px solid #1e2a3a;
+  display:flex;flex-direction:column;
+}
+#log-panel .log-header{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:12px 16px;
+  border-bottom:1px solid #1e2a3a;
+  font-size:12px;color:#8b949e;text-transform:uppercase;letter-spacing:1px;
+}
+#log-panel .log-header .packet-count{color:#00ff88;font-weight:700}
+#log-entries{
+  flex:1;overflow-y:auto;padding:6px;
+  scrollbar-width:thin;scrollbar-color:#1e2a3a transparent;
+}
+#log-entries::-webkit-scrollbar{width:4px}
+#log-entries::-webkit-scrollbar-thumb{background:#1e2a3a;border-radius:4px}
+.log-entry{
+  font-size:11px;padding:5px 10px;margin:2px 0;
+  border-radius:3px;
+  background:rgba(22,27,34,0.6);
+  border-left:3px solid #30363d;
+  display:flex;align-items:center;gap:8px;
+  animation:fadeIn .3s ease;
+}
+@keyframes fadeIn{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:translateX(0)}}
+.log-entry .time{color:#484f58;font-size:10px;white-space:nowrap;min-width:52px}
+.log-entry .node-tag{
+  font-weight:600;padding:1px 6px;border-radius:3px;font-size:10px;
+  white-space:nowrap;min-width:48px;text-align:center;
+}
+.log-entry .node-tag.phone{background:#1a2a4a;color:#58a6ff}
+.log-entry .node-tag.bank{background:#2d1a4a;color:#d2a8ff}
+.log-entry .action{font-weight:500;font-size:10px;text-transform:uppercase;letter-spacing:0.5px}
+.log-entry .action.received{color:#00ff88}
+.log-entry .action.forwarded{color:#58a6ff}
+.log-entry .action.dropped{color:#f85149}
+.log-entry .action.settled{color:#d2a8ff}
+.log-entry .action.rejected{color:#f85149}
+.log-entry .action.end_of_line{color:#8b949e}
+.log-entry.received{border-left-color:#00ff88}
+.log-entry.forwarded{border-left-color:#58a6ff}
+.log-entry.dropped{border-left-color:#f85149}
+.log-entry.settled{border-left-color:#d2a8ff}
+.log-entry.rejected{border-left-color:#f85149}
+.log-entry.end_of_line{border-left-color:#8b949e}
+.log-entry .msg{color:#484f58;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+#empty-state{
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  height:100%;color:#484f58;text-align:center;padding:20px;
+}
+#empty-state .icon{font-size:36px;margin-bottom:12px;opacity:0.5}
+#empty-state h3{font-size:13px;font-weight:400;margin-bottom:6px}
+#empty-state p{font-size:11px;color:#30363d}
+@media(max-width:800px){
+  #log-panel{width:240px;min-width:240px}
+}
+</style>
+</head>
+<body>
+
+<div id="header">
+  <div class="left">
+    <h1>🔗 <span>UPI</span> Mesh Packet Visualizer</h1>
+  </div>
+  <div style="display:flex;align-items:center;gap:16px">
+    <div id="status"><span class="dot red"></span> Connecting</div>
+    <button class="reset-btn" onclick="resetAll()">✕ Reset</button>
+  </div>
+</div>
+
+<div id="main">
+  <div id="canvas-container">
+    <canvas id="meshCanvas"></canvas>
+  </div>
+  <div id="log-panel">
+    <div class="log-header">
+      <span>📋 Packet Log</span>
+      <span class="packet-count" id="packetCount">0</span>
+    </div>
+    <div id="log-entries">
+      <div id="empty-state">
+        <div class="icon">📡</div>
+        <h3>Waiting for packets...</h3>
+        <p>Send a packet through the mesh<br>to see it visualized here</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const TOPOLOGY = {{ topology|safe }};
+
+const NODE_LIST = ["Node-1", "Node-2", "Node-3", "Node-4", "Node-5", "Node-6", "Node-7", "Node-8", "Node-9", "Node-10", "Bank"];
+const PADDING = 60;
+const NODE_RADIUS = 32;
+
+let activeNodes = new Set();
+let movingPackets = [];
+let nodePulses = {};
+let eventCount = 0;
+let logCount = 0;
+
+function normalizePositions() {
+  const raw = TOPOLOGY.positions;
+  let maxX = 0, maxY = 0;
+  for (const p of Object.values(raw)) {
+    maxX = Math.max(maxX, p.x);
+    maxY = Math.max(maxY, p.y);
+  }
+  const out = {};
+  for (const [id, p] of Object.entries(raw)) {
+    out[id] = { x: p.x / maxX, y: p.y / maxY };
+  }
+  return out;
+}
+const NPOS = normalizePositions();
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+// ---- Canvas setup ----
+const canvas = document.getElementById('meshCanvas');
+const ctx = canvas.getContext('2d');
+
+function resize() {
+  const r = canvas.parentElement.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = r.width * dpr;
+  canvas.height = r.height * dpr;
+  canvas.style.width = r.width + 'px';
+  canvas.style.height = r.height + 'px';
+  ctx.scale(dpr, dpr);
+  return {w: r.width, h: r.height};
+}
+
+function cw() { return canvas.parentElement.getBoundingClientRect().width; }
+function ch() { return canvas.parentElement.getBoundingClientRect().height; }
+
+// ---- Drawing helpers ----
+function drawBackground(w, h) {
+  const g = ctx.createRadialGradient(w/2, h/2, 0, w/2, h/2, Math.max(w,h)*0.7);
+  g.addColorStop(0, '#111827');
+  g.addColorStop(1, '#0a0e17');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, w, h);
+
+  ctx.strokeStyle = 'rgba(30,42,58,0.25)';
+  ctx.lineWidth = 1;
+  const S = 50;
+  for (let x = S; x < w; x += S) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke(); }
+  for (let y = S; y < h; y += S) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }
+}
+
+function nodePos(id, w, h) {
+  const p = NPOS[id];
+  const marginX = PADDING;
+  const marginY = PADDING;
+  return {
+    x: marginX + p.x * (w - 2 * marginX),
+    y: marginY + p.y * (h - 2 * marginY)
+  };
+}
+
+function drawEdge(idFrom, idTo, active, dashed, w, h) {
+  const f = nodePos(idFrom, w, h);
+  const t = nodePos(idTo, w, h);
+  const dx = t.x - f.x, dy = t.y - f.y;
+  const dist = Math.sqrt(dx*dx + dy*dy);
+  if (dist < 1) return;
+  const nx = dx/dist, ny = dy/dist;
+  const shorten = NODE_RADIUS + 4;
+  const sx = f.x + nx * shorten, sy = f.y + ny * shorten;
+  const ex = t.x - nx * shorten, ey = t.y - ny * shorten;
+
+  ctx.beginPath();
+  ctx.moveTo(sx, sy);
+  ctx.lineTo(ex, ey);
+  ctx.strokeStyle = active ? 'rgba(0,255,136,0.3)' : (dashed ? 'rgba(30,42,58,0.4)' : '#1e2a3a');
+  ctx.lineWidth = active ? 3 : (dashed ? 1 : 2);
+  if (dashed) ctx.setLineDash([5, 5]); else ctx.setLineDash([]);
+  if (active) { ctx.shadowColor = '#00ff88'; ctx.shadowBlur = 8; }
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+  ctx.setLineDash([]);
+
+  if (active) {
+    const midX = (sx + ex) / 2, midY = (sy + ey) / 2;
+    for (let i = 0; i < 3; i++) {
+      const t2 = 0.3 + i * 0.2;
+      const px = lerp(sx, ex, t2), py = lerp(sy, ey, t2);
+      ctx.fillStyle = `rgba(0,255,136,${0.1 + i * 0.08})`;
+      ctx.beginPath(); ctx.arc(px, py, 2 + i, 0, Math.PI*2); ctx.fill();
+    }
+  }
+}
+
+function drawNode(id, active, error, settled, pulse, w, h) {
+  const p = nodePos(id, w, h);
+  const x = p.x, y = p.y;
+  const r = NODE_RADIUS;
+
+  if (active && pulse > 0) {
+    const glowColor = settled ? '#d2a8ff' : '#00ff88';
+    const expand = r * (1 + pulse * 0.6);
+    const g = ctx.createRadialGradient(x, y, r, x, y, expand);
+    g.addColorStop(0, `${glowColor}${Math.round(0.15 * (1 - pulse) * 255).toString(16).padStart(2,'0')}`);
+    g.addColorStop(1, `${glowColor}00`);
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(x, y, expand, 0, Math.PI*2); ctx.fill();
+  }
+
+  const grad = ctx.createRadialGradient(x - r*0.25, y - r*0.25, 0, x, y, r);
+  if (settled) { grad.addColorStop(0,'#d2a8ff'); grad.addColorStop(1,'#6b3fa0'); }
+  else if (error) { grad.addColorStop(0,'#f85149'); grad.addColorStop(1,'#8b1515'); }
+  else if (active) { grad.addColorStop(0,'#00ff88'); grad.addColorStop(1,'#006644'); }
+  else { grad.addColorStop(0,'#1e2a4a'); grad.addColorStop(1,'#0d1117'); }
+
+  ctx.shadowColor = settled ? '#d2a8ff' : (active ? '#00ff88' : 'transparent');
+  ctx.shadowBlur = active ? 16 + Math.sin(Date.now()/300)*6 : 0;
+  ctx.fillStyle = grad;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.fill();
+  ctx.shadowBlur = 0;
+
+  ctx.strokeStyle = settled ? '#d2a8ff' : (active ? '#00ff88' : '#1e2a3a');
+  ctx.lineWidth = active || settled ? 2.5 : 1;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.stroke();
+
+  const icon = id === 'Bank' ? '🏦' : '📱';
+  ctx.font = '18px sans-serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(icon, x, y - 1);
+
+  ctx.fillStyle = settled ? '#d2a8ff' : (active ? '#00ff88' : '#8b949e');
+  ctx.font = 'bold 11px "Courier New",monospace';
+  ctx.textBaseline = 'top';
+  ctx.fillText(id, x, y + r + 10);
+
+  if (settled) {
+    ctx.fillStyle = 'rgba(210,168,255,0.5)';
+    ctx.font = '8px "Courier New",monospace';
+    ctx.textBaseline = 'top';
+    ctx.fillText('✓ SETTLED', x, y + r + 24);
+  }
+}
+
+function drawMovingPacket(mp, w, h) {
+  if (mp.progress >= 1) return;
+  const from = nodePos(mp.fromNode, w, h);
+  const to = nodePos(mp.toNode, w, h);
+  const x = lerp(from.x, to.x, mp.progress);
+  const y = lerp(from.y, to.y, mp.progress);
+
+  const trail = mp.trail;
+  for (let i = 0; i < trail.length; i++) {
+    const a = (i / trail.length) * 0.5;
+    const s = 1.5 + (i / trail.length) * 4;
+    ctx.fillStyle = `rgba(0,255,136,${a})`;
+    ctx.beginPath(); ctx.arc(trail[i].x, trail[i].y, s, 0, Math.PI*2); ctx.fill();
+  }
+
+  const glow = ctx.createRadialGradient(x, y, 0, x, y, 22);
+  glow.addColorStop(0, 'rgba(0,255,136,0.5)');
+  glow.addColorStop(0.4, 'rgba(0,200,255,0.2)');
+  glow.addColorStop(1, 'rgba(0,255,136,0)');
+  ctx.fillStyle = glow;
+  ctx.beginPath(); ctx.arc(x, y, 22, 0, Math.PI*2); ctx.fill();
+
+  ctx.shadowColor = '#00ff88';
+  ctx.shadowBlur = 18;
+  ctx.fillStyle = '#ffffff';
+  ctx.beginPath(); ctx.arc(x, y, 4.5, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#00ff88';
+  ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI*2); ctx.fill();
+  ctx.shadowBlur = 0;
+}
+
+// ---- Packet animation ----
+class MovingPacket {
+  constructor(fromNode, toNode) {
+    this.fromNode = fromNode;
+    this.toNode = toNode;
+    this.progress = 0;
+    this.speed = 0.006 + Math.random() * 0.002;
+    this.trail = [];
+    this.id = Math.random();
+  }
+  update(w, h) {
+    this.progress += this.speed;
+    const from = nodePos(this.fromNode, w, h);
+    const to = nodePos(this.toNode, w, h);
+    this.trail.push({x: lerp(from.x, to.x, this.progress), y: lerp(from.y, to.y, this.progress)});
+    if (this.trail.length > 18) this.trail.shift();
+    return this.progress < 1;
+  }
+}
+
+// ---- Event processing ----
+let lastActiveIdx = -1;
+
+function processEvent(evt) {
+  eventCount++;
+  document.getElementById('packetCount').textContent = eventCount;
+
+  const { node_id, action } = evt;
+  const lower = action.toLowerCase();
+  hideEmpty();
+
+  if (action === 'RECEIVED') {
+    activeNodes.add(node_id);
+    nodePulses[node_id] = { start: Date.now(), active: true };
+  }
+
+  if (action === 'FORWARDED') {
+    const toNode = evt.to_node;
+    if (toNode) {
+      movingPackets.push(new MovingPacket(node_id, toNode));
+    }
+  }
+
+  if (action === 'DROPPED') {
+    nodePulses[node_id] = { start: Date.now(), error: true, active: true };
+  }
+
+  if (action === 'REJECTED') {
+    nodePulses[node_id] = { start: Date.now(), error: true, active: true };
+  }
+
+  if (action === 'SETTLED') {
+    activeNodes.add(node_id);
+    nodePulses[node_id] = { start: Date.now(), active: true, settled: true };
+  }
+
+  addLogEntry(evt);
+}
+
+function hideEmpty() {
+  const empty = document.getElementById('empty-state');
+  if (empty) empty.remove();
+}
+
+function addLogEntry(evt) {
+  logCount++;
+  const entries = document.getElementById('log-entries');
+  const div = document.createElement('div');
+  const action = evt.action.toLowerCase();
+  div.className = `log-entry ${action}`;
+  const t = new Date(evt.timestamp || Date.now());
+  const time = t.toLocaleTimeString('en-US', {hour12: false, hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  const isBank = evt.node_id === 'Bank';
+  div.innerHTML = `
+    <span class="time">${time}</span>
+    <span class="node-tag ${isBank ? 'bank' : 'phone'}">${evt.node_id}</span>
+    <span class="action ${action}">${evt.action}</span>
+    <span class="msg">${evt.message || ''}</span>
+  `;
+  entries.appendChild(div);
+  entries.scrollTop = entries.scrollHeight;
+}
+
+// ---- SSE ----
+let eventSource = null;
+
+function connectSSE() {
+  if (eventSource) eventSource.close();
+  eventSource = new EventSource('/events');
+  eventSource.onmessage = (e) => {
+    if (e.data) {
+      try {
+        const evt = JSON.parse(e.data);
+        processEvent(evt);
+      } catch(_) {}
+    }
+  };
+  eventSource.onopen = () => {
+    document.getElementById('status').innerHTML = '<span class="dot green"></span> Connected';
+  };
+  eventSource.onerror = () => {
+    document.getElementById('status').innerHTML = '<span class="dot red"></span> Disconnected';
+    setTimeout(connectSSE, 2000);
+  };
+}
+
+function resetAll() {
+  fetch('/reset', {method:'POST'}).catch(()=>{});
+  movingPackets = [];
+  activeNodes.clear();
+  nodePulses = {};
+  eventCount = 0;
+  logCount = 0;
+  lastActiveIdx = -1;
+  document.getElementById('packetCount').textContent = '0';
+  document.getElementById('log-entries').innerHTML = '';
+  document.getElementById('log-entries').innerHTML =
+    `<div id="empty-state">
+      <div class="icon">📡</div>
+      <h3>Waiting for packets...</h3>
+      <p>Send a packet through the mesh<br>to see it visualized here</p>
+    </div>`;
+}
+
+// ---- Main loop ----
+let frame = 0;
+
+function render() {
+  frame++;
+  resize();
+  const w = cw(), h = ch();
+  if (w < 10 || h < 10) { requestAnimationFrame(render); return; }
+
+  ctx.clearRect(0, 0, w, h);
+  drawBackground(w, h);
+
+  for (const edge of TOPOLOGY.edges) {
+    const active = activeNodes.has(edge.to);
+    const dashed = edge.dashed || false;
+    drawEdge(edge.from, edge.to, active, dashed, w, h);
+  }
+
+  movingPackets = movingPackets.filter(mp => {
+    const alive = mp.update(w, h);
+    if (alive) drawMovingPacket(mp, w, h);
+    return alive;
+  });
+
+  for (const node of TOPOLOGY.nodes) {
+    const active = activeNodes.has(node);
+    const pulse = nodePulses[node];
+    let pulseVal = 0;
+    let error = false;
+    let settled = false;
+    if (pulse) {
+      const elapsed = Date.now() - pulse.start;
+      if (pulse.error) error = true;
+      if (pulse.settled) settled = true;
+      if (elapsed < 1200) {
+        pulseVal = 1 - elapsed / 1200;
+      } else {
+        if (!pulse.error && !pulse.settled) pulseVal = 0.15 + Math.sin(Date.now() / 600 + NODE_LIST.indexOf(node)) * 0.08;
+      }
+    }
+    drawNode(node, active, error, settled, pulseVal, w, h);
+  }
+
+  requestAnimationFrame(render);
+}
+
+// ---- Init ----
+window.onload = () => {
+  resize();
+  connectSSE();
+  render();
+};
+window.onresize = resize;
+</script>
+</body>
+</html>

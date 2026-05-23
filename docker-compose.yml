@@ -1,47 +1,22 @@
-version: '3.8'
-
 services:
+  visualizer:
+    build: ./visualizer
+    ports:
+      - "5002:5002"
+    networks:
+      - mesh-net
+
   spring-bank:
     build: .
     ports:
       - "8080:8080"
+    environment:
+      - VISUALIZER_URL=http://visualizer:5002
     networks:
       - mesh-net
-
-  node-5-gateway:
-    build: ./phone-node
     depends_on:
-      spring-bank:
+      visualizer:
         condition: service_started
-    environment:
-      - NODE_ID=Node-5
-      - NEXT_NODE_URL=http://spring-bank:8080/api/mesh/upload
-    networks:
-      - mesh-net
-
-  node-4:
-    build: ./phone-node
-    environment:
-      - NODE_ID=Node-4
-      - NEXT_NODE_URL=http://node-5-gateway:5001/receive
-    networks:
-      - mesh-net
-
-  node-3:
-    build: ./phone-node
-    environment:
-      - NODE_ID=Node-3
-      - NEXT_NODE_URL=http://node-4:5001/receive
-    networks:
-      - mesh-net
-
-  node-2:
-    build: ./phone-node
-    environment:
-      - NODE_ID=Node-2
-      - NEXT_NODE_URL=http://node-3:5001/receive
-    networks:
-      - mesh-net
 
   node-1-alice:
     build: ./phone-node
@@ -49,7 +24,102 @@ services:
       - "5001:5001"
     environment:
       - NODE_ID=Node-1
-      - NEXT_NODE_URL=http://node-2:5001/receive
+      - VISUALIZER_URL=http://visualizer:5002
+    volumes:
+      - ./mesh-topology.json:/app/mesh-topology.json:ro
+    networks:
+      - mesh-net
+
+  node-2:
+    build: ./phone-node
+    environment:
+      - NODE_ID=Node-2
+      - VISUALIZER_URL=http://visualizer:5002
+    volumes:
+      - ./mesh-topology.json:/app/mesh-topology.json:ro
+    networks:
+      - mesh-net
+
+  node-3:
+    build: ./phone-node
+    environment:
+      - NODE_ID=Node-3
+      - VISUALIZER_URL=http://visualizer:5002
+    volumes:
+      - ./mesh-topology.json:/app/mesh-topology.json:ro
+    networks:
+      - mesh-net
+
+  node-4:
+    build: ./phone-node
+    environment:
+      - NODE_ID=Node-4
+      - VISUALIZER_URL=http://visualizer:5002
+    volumes:
+      - ./mesh-topology.json:/app/mesh-topology.json:ro
+    networks:
+      - mesh-net
+
+  node-5:
+    build: ./phone-node
+    environment:
+      - NODE_ID=Node-5
+      - VISUALIZER_URL=http://visualizer:5002
+    volumes:
+      - ./mesh-topology.json:/app/mesh-topology.json:ro
+    networks:
+      - mesh-net
+
+  node-6:
+    build: ./phone-node
+    environment:
+      - NODE_ID=Node-6
+      - VISUALIZER_URL=http://visualizer:5002
+    volumes:
+      - ./mesh-topology.json:/app/mesh-topology.json:ro
+    networks:
+      - mesh-net
+
+  node-7:
+    build: ./phone-node
+    environment:
+      - NODE_ID=Node-7
+      - VISUALIZER_URL=http://visualizer:5002
+    volumes:
+      - ./mesh-topology.json:/app/mesh-topology.json:ro
+    networks:
+      - mesh-net
+
+  node-8:
+    build: ./phone-node
+    environment:
+      - NODE_ID=Node-8
+      - VISUALIZER_URL=http://visualizer:5002
+    volumes:
+      - ./mesh-topology.json:/app/mesh-topology.json:ro
+    networks:
+      - mesh-net
+
+  node-9:
+    build: ./phone-node
+    environment:
+      - NODE_ID=Node-9
+      - VISUALIZER_URL=http://visualizer:5002
+    volumes:
+      - ./mesh-topology.json:/app/mesh-topology.json:ro
+    networks:
+      - mesh-net
+
+  node-10-gateway:
+    build: ./phone-node
+    environment:
+      - NODE_ID=Node-10
+      - VISUALIZER_URL=http://visualizer:5002
+    volumes:
+      - ./mesh-topology.json:/app/mesh-topology.json:ro
+    depends_on:
+      spring-bank:
+        condition: service_started
     networks:
       - mesh-net
 

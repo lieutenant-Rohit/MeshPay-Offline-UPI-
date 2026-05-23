@@ -16,16 +16,26 @@ import base64
 import time
 import uuid
 import os
+import sys
 import requests
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.backends import default_backend
 
-SERVER_URL = "http://localhost:8080"
+BANK_URL   = "http://localhost:8080"
+MESH_ENTRY = "http://localhost:5001"
 ALICE_VPA  = "alice@bank"
 BOB_VPA    = "bob@bank"
 KEY_FILE   = "alice_private.pem"
+
+USE_MESH = "--mesh" in sys.argv
+UPLOAD_URL = f"{MESH_ENTRY}/receive" if USE_MESH else f"{BANK_URL}/api/mesh/upload"
+
+if USE_MESH:
+    print("🌐 MESH MODE: packet enters at Node-1 → hops through mesh → bank\n")
+else:
+    print("☁️ DIRECT MODE: packet sent straight to bank server\n")
 
 
 # ── 1. Load or generate Alice's key pair ────────────────────────────────────
@@ -55,7 +65,7 @@ alice_pub_b64 = base64.b64encode(alice_pub_der).decode()
 
 print(f"\n📡 Provisioning Alice ({ALICE_VPA}) with the bank server...")
 provision_resp = requests.post(
-    f"{SERVER_URL}/api/mesh/provision",
+    f"{BANK_URL}/api/mesh/provision",
     json={"vpa": ALICE_VPA, "publicKey": alice_pub_b64},
     timeout=10)
 provision_resp.raise_for_status()
@@ -94,7 +104,7 @@ bob_pub_b64 = base64.b64encode(
 ).decode()
 
 bob_resp = requests.post(
-    f"{SERVER_URL}/api/mesh/provision",
+    f"{BANK_URL}/api/mesh/provision",
     json={"vpa": BOB_VPA, "publicKey": bob_pub_b64},
     timeout=10)
 bob_resp.raise_for_status()
@@ -155,22 +165,25 @@ signature_b64 = base64.b64encode(signature).decode()
 
 mesh_packet = {
     "packetId":  f"PKT_{str(uuid.uuid4())[:8].upper()}",
-    "ttl":        5,
+    "ttl":        10,
     "createdAt":  current_millis,
     "senderVpa":  ALICE_VPA,
     "signature":  signature_b64,
     "ciphertext": ciphertext,
 }
 
-print("\n📦 Mesh packet assembled. Uploading to bank gateway...")
+print("\n📦 Mesh packet assembled. Uploading...")
+if USE_MESH:
+    print(f"   Route: {MESH_ENTRY}/receive → Node-1 → ... → Bank\n")
+else:
+    print(f"   Route: {BANK_URL}/api/mesh/upload (direct)\n")
 
-
-# ── 8. POST to bank gateway ──────────────────────────────────────────────────
+# ── 8. Upload — direct to bank or through mesh nodes ────────────────────────
 
 upload_resp = requests.post(
-    f"{SERVER_URL}/api/mesh/upload",
+    UPLOAD_URL,
     json=mesh_packet,
-    timeout=10)
+    timeout=30)
 
 print(f"\n{'✅' if upload_resp.ok else '❌'} Server response [{upload_resp.status_code}]:")
 print(upload_resp.text)
