@@ -31,3 +31,15 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### Python ###
+__pycache__/
+.mypy_cache/
+venv/
+
+### Temp Artifacts ###
+*.log
+*.pem
+server.log
+server2.log
+data/

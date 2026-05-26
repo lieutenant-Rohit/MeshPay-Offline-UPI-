@@ -4,16 +4,20 @@ import jakarta.persistence.*;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.UUID;
 
 @Entity
-// FIX: was "tranaction" (missing 's') — corrected to "transactions"
 @Table(name = "transactions",
-        indexes = {@Index(name = "idx_packet_hash", columnList = "packetHash", unique = true)})
+        indexes = {
+                @Index(name = "idx_packet_hash", columnList = "packetHash", unique = true),
+                @Index(name = "idx_tx_sender", columnList = "senderVpa,settleAt"),
+                @Index(name = "idx_tx_receiver", columnList = "receiverVpa,settleAt"),
+                @Index(name = "idx_tx_status", columnList = "status,settleAt")
+        })
 public class Transaction {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    private Long id;
+    private UUID id;
 
     @Column(nullable = false, unique = true, length = 64)
     private String packetHash;
@@ -39,8 +43,6 @@ public class Transaction {
     @Column(nullable = false)
     private int hopCount;
 
-    // FIX: removed "import org.hibernate.engine.spi.Status" which shadowed this enum.
-    // The @Enumerated annotation now correctly maps to Transaction.Status below.
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
     private Status status;
@@ -50,10 +52,11 @@ public class Transaction {
     }
 
     public Transaction() {
+        this.id = UUID.randomUUID();
     }
 
-    public Long getId() { return id; }
-    public void setId(Long id) { this.id = id; }
+    public UUID getId() { return id; }
+    public void setId(UUID id) { this.id = id; }
     public String getPacketHash() { return packetHash; }
     public void setPacketHash(String packetHash) { this.packetHash = packetHash; }
     public String getSenderVpa() { return senderVpa; }

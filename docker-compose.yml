@@ -1,4 +1,34 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: paymentdb
+      POSTGRES_USER: payment_user
+      POSTGRES_PASSWORD: payment_pass
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payment_user -d paymentdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mesh-net
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - mesh-net
+
   visualizer:
     build: ./visualizer
     ports:
@@ -6,17 +36,62 @@ services:
     networks:
       - mesh-net
 
-  spring-bank:
+  spring-bank-1:
     build: .
     ports:
-      - "8080:8080"
+      - "8081:8080"
     environment:
+      - SERVER_PORT=8080
       - VISUALIZER_URL=http://visualizer:5002
+      - PAYMENT_RATELIMIT_PER_VPA=100000
+      - PAYMENT_RATELIMIT_PER_VPA_WINDOW_SECONDS=60
+      - PAYMENT_RATELIMIT_GLOBAL=500000
+      - PAYMENT_RATELIMIT_GLOBAL_WINDOW_SECONDS=60
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
       - mesh-net
+
+  spring-bank-2:
+    build: .
+    ports:
+      - "8082:8080"
+    environment:
+      - SERVER_PORT=8080
+      - VISUALIZER_URL=http://visualizer:5002
+      - PAYMENT_RATELIMIT_PER_VPA=100000
+      - PAYMENT_RATELIMIT_PER_VPA_WINDOW_SECONDS=60
+      - PAYMENT_RATELIMIT_GLOBAL=500000
+      - PAYMENT_RATELIMIT_GLOBAL_WINDOW_SECONDS=60
     depends_on:
-      visualizer:
-        condition: service_started
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - mesh-net
+
+  spring-bank-3:
+    build: .
+    ports:
+      - "8083:8080"
+    environment:
+      - SERVER_PORT=8080
+      - VISUALIZER_URL=http://visualizer:5002
+      - PAYMENT_RATELIMIT_PER_VPA=100000
+      - PAYMENT_RATELIMIT_PER_VPA_WINDOW_SECONDS=60
+      - PAYMENT_RATELIMIT_GLOBAL=500000
+      - PAYMENT_RATELIMIT_GLOBAL_WINDOW_SECONDS=60
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - mesh-net
 
   node-1-alice:
     build: ./phone-node
@@ -118,10 +193,13 @@ services:
     volumes:
       - ./mesh-topology.json:/app/mesh-topology.json:ro
     depends_on:
-      spring-bank:
+      spring-bank-1:
         condition: service_started
     networks:
       - mesh-net
+
+volumes:
+  pgdata:
 
 networks:
   mesh-net:

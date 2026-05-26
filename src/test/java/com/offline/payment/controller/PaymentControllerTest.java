@@ -1,6 +1,7 @@
 package com.offline.payment.controller;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.offline.payment.config.AsyncEventService;
 import com.offline.payment.model.MeshPacket;
 import com.offline.payment.service.PaymentProcessorService;
 import org.junit.jupiter.api.BeforeEach;
@@ -16,7 +17,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doThrow;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
-import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @WebMvcTest(PaymentController.class)
@@ -31,9 +32,11 @@ public class PaymentControllerTest {
     @MockBean
     private PaymentProcessorService paymentProcessorService;
 
+    @MockBean
+    private AsyncEventService asyncEventService;
+
     private MeshPacket validPacket;
 
-    // Added 'public' here!
     @BeforeEach
     public void setUp() {
         validPacket = new MeshPacket();
@@ -47,19 +50,19 @@ public class PaymentControllerTest {
 
     @Test
     @DisplayName("Should return 200 OK when Bank successfully processes a valid packet")
-    public void testUploadPacket_Success() throws Exception { // Added 'public' here!
+    public void testUploadPacket_Success() throws Exception {
         doNothing().when(paymentProcessorService).processIncomingPacket(any(MeshPacket.class));
 
         mockMvc.perform(post("/api/mesh/upload")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(validPacket)))
                 .andExpect(status().isOk())
-                .andExpect(content().string("Transaction Processed and Settled Successfully!"));
+                .andExpect(jsonPath("$.status").value("success"));
     }
 
     @Test
     @DisplayName("Should return 403 Forbidden when Cryptographic Signature is invalid")
-    public void testUploadPacket_SecurityViolation() throws Exception { // Added 'public' here!
+    public void testUploadPacket_SecurityViolation() throws Exception {
         doThrow(new SecurityException("Invalid digital wax seal!"))
                 .when(paymentProcessorService).processIncomingPacket(any(MeshPacket.class));
 
@@ -67,12 +70,13 @@ public class PaymentControllerTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(validPacket)))
                 .andExpect(status().isForbidden())
-                .andExpect(content().string("Security Violation: Invalid digital wax seal!"));
+                .andExpect(jsonPath("$.error").value("security_violation"))
+                .andExpect(jsonPath("$.message").value("Invalid digital wax seal!"));
     }
 
     @Test
     @DisplayName("Should return 500 Internal Server Error when Database/Ledger fails")
-    public void testUploadPacket_InternalServerError() throws Exception { // Added 'public' here!
+    public void testUploadPacket_InternalServerError() throws Exception {
         doThrow(new RuntimeException("Database connection timeout"))
                 .when(paymentProcessorService).processIncomingPacket(any(MeshPacket.class));
 
@@ -80,6 +84,7 @@ public class PaymentControllerTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(validPacket)))
                 .andExpect(status().isInternalServerError())
-                .andExpect(content().string("Internal Error: Database connection timeout"));
+                .andExpect(jsonPath("$.error").value("internal_error"))
+                .andExpect(jsonPath("$.message").value("Database connection timeout"));
     }
 }

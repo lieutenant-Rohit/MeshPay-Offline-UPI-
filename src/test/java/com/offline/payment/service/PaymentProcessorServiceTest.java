@@ -1,5 +1,6 @@
 package com.offline.payment.service;
 
+import com.offline.payment.config.CacheService;
 import com.offline.payment.model.MeshPacket;
 import com.offline.payment.model.Transaction;
 import com.offline.payment.model.User;
@@ -44,6 +45,12 @@ public class PaymentProcessorServiceTest {
     @Mock
     private LedgerService ledgerService;
 
+    @Mock
+    private CacheService cacheService;
+
+    @Mock
+    private OutboxService outboxService;
+
     @InjectMocks
     private PaymentProcessorService paymentProcessorService;
 
@@ -78,21 +85,19 @@ public class PaymentProcessorServiceTest {
     @Test
     @DisplayName("Should process valid packet, transfer funds, and save transaction")
     public void testProcessPacket_Success() throws Exception {
-        // Arrange
+        when(cacheService.isPacketHashProcessed(anyString())).thenReturn(false);
         when(transactionRepository.existsByPacketHash(anyString())).thenReturn(false);
+        when(cacheService.getCachedUser(anyString())).thenReturn(null);
         when(userRepository.findByVpa("alice@bank")).thenReturn(Optional.of(senderAlice));
 
-        // Pass any PublicKey object to match your actual method signature
         when(signatureService.verifySignature(anyString(), anyString(), any(PublicKey.class))).thenReturn(true);
         when(cryptoService.decryptPayload("ENCRYPTED_SAFE_DATA")).thenReturn(validPayloadJson);
 
-        // Act
         paymentProcessorService.processIncomingPacket(incomingPacket);
 
-        // Assert: Verify money was actually moved using BigDecimal!
         verify(ledgerService, times(1)).transferFunds(eq("alice@bank"), eq("bob@bank"), any(BigDecimal.class));
+        verify(outboxService, times(1)).publishEvent(anyString(), eq("alice@bank"), eq("bob@bank"), any(BigDecimal.class));
 
-        // Assert: Capture the saved transaction to ensure it was logged correctly
         ArgumentCaptor<Transaction> txCaptor = ArgumentCaptor.forClass(Transaction.class);
         verify(transactionRepository, times(1)).save(txCaptor.capture());
 
@@ -102,33 +107,51 @@ public class PaymentProcessorServiceTest {
     }
 
     @Test
-    @DisplayName("Should block Replay Attacks (Duplicate Packets)")
-    public void testProcessPacket_ReplayAttack_ThrowsException() {
+    @DisplayName("Should block Replay Attacks (Duplicate Packets) - Cache hit")
+    public void testProcessPacket_ReplayAttack_CacheHit_ThrowsException() {
+        when(cacheService.isPacketHashProcessed(anyString())).thenReturn(true);
+
+        SecurityException exception = assertThrows(SecurityException.class, () ->
+                paymentProcessorService.processIncomingPacket(incomingPacket)
+        );
+
+        assertTrue(exception.getMessage().contains("Duplicate packet detected"));
+        verify(ledgerService, never()).transferFunds(anyString(), anyString(), any(BigDecimal.class));
+        verify(outboxService, never()).publishEvent(anyString(), anyString(), anyString(), any(BigDecimal.class));
+    }
+
+    @Test
+    @DisplayName("Should block Replay Attacks (Duplicate Packets) - DB hit")
+    public void testProcessPacket_ReplayAttack_DbHit_ThrowsException() {
+        when(cacheService.isPacketHashProcessed(anyString())).thenReturn(false);
         when(transactionRepository.existsByPacketHash(anyString())).thenReturn(true);
 
         SecurityException exception = assertThrows(SecurityException.class, () ->
                 paymentProcessorService.processIncomingPacket(incomingPacket)
         );
 
-        assertTrue(exception.getMessage().contains("Duplicate Packet Detected"));
+        assertTrue(exception.getMessage().contains("Duplicate packet detected"));
         verify(ledgerService, never()).transferFunds(anyString(), anyString(), any(BigDecimal.class));
+        verify(outboxService, never()).publishEvent(anyString(), anyString(), anyString(), any(BigDecimal.class));
     }
 
     @Test
     @DisplayName("Should drop packet if Digital Signature is invalid")
     public void testProcessPacket_InvalidSignature_ThrowsException() throws Exception {
+        when(cacheService.isPacketHashProcessed(anyString())).thenReturn(false);
         when(transactionRepository.existsByPacketHash(anyString())).thenReturn(false);
+        when(cacheService.getCachedUser(anyString())).thenReturn(null);
         when(userRepository.findByVpa("alice@bank")).thenReturn(Optional.of(senderAlice));
 
-        // Simulate a hacker altering the data, causing the signature check to fail
         when(signatureService.verifySignature(anyString(), anyString(), any(PublicKey.class))).thenReturn(false);
 
         SecurityException exception = assertThrows(SecurityException.class, () ->
                 paymentProcessorService.processIncomingPacket(incomingPacket)
         );
 
-        assertTrue(exception.getMessage().contains("Signature Verification Failed"));
+        assertTrue(exception.getMessage().contains("Signature verification failed"));
         verify(cryptoService, never()).decryptPayload(anyString());
+        verify(outboxService, never()).publishEvent(anyString(), anyString(), anyString(), any(BigDecimal.class));
     }
 
     @Test
@@ -142,7 +165,9 @@ public class PaymentProcessorServiceTest {
                 "\"signedAt\":" + oldTimestamp +
                 "}";
 
+        when(cacheService.isPacketHashProcessed(anyString())).thenReturn(false);
         when(transactionRepository.existsByPacketHash(anyString())).thenReturn(false);
+        when(cacheService.getCachedUser(anyString())).thenReturn(null);
         when(userRepository.findByVpa("alice@bank")).thenReturn(Optional.of(senderAlice));
         when(signatureService.verifySignature(anyString(), anyString(), any(PublicKey.class))).thenReturn(true);
         when(cryptoService.decryptPayload("ENCRYPTED_SAFE_DATA")).thenReturn(expiredPayloadJson);
@@ -151,7 +176,8 @@ public class PaymentProcessorServiceTest {
                 paymentProcessorService.processIncomingPacket(incomingPacket)
         );
 
-        assertTrue(exception.getMessage().contains("Packet Expired"));
+        assertTrue(exception.getMessage().contains("Packet expired"));
         verify(ledgerService, never()).transferFunds(anyString(), anyString(), any(BigDecimal.class));
+        verify(outboxService, never()).publishEvent(anyString(), anyString(), anyString(), any(BigDecimal.class));
     }
 }

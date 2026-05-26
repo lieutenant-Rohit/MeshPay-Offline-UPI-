@@ -25,7 +25,7 @@
     "Node-10": ["Node-9", "Bank"],
     "Bank":    []
   },
-  "bankUrl": "http://spring-bank:8080/api/mesh/upload",
+  "bankUrl": "http://spring-bank-1:8080/api/mesh/upload",
   "bankNodeId": "Bank",
   "nodeUrls": {
     "Node-1":  "http://node-1-alice:5001",
@@ -38,6 +38,6 @@
     "Node-8":  "http://node-8:5001",
     "Node-9":  "http://node-9:5001",
     "Node-10": "http://node-10-gateway:5001",
-    "Bank":    "http://spring-bank:8080/api/mesh/upload"
+    "Bank":    "http://spring-bank-1:8080/api/mesh/upload"
   }
 }

@@ -1,13 +1,12 @@
 package com.offline.payment.controller;
 
+import com.offline.payment.config.AsyncEventService;
 import com.offline.payment.model.MeshPacket;
 import com.offline.payment.service.PaymentProcessorService;
 import jakarta.validation.Valid;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
-import org.springframework.web.client.RestTemplate;
 
-import java.util.HashMap;
 import java.util.Map;
 
 @RestController
@@ -15,43 +14,27 @@ import java.util.Map;
 public class PaymentController {
 
     private final PaymentProcessorService paymentProcessorService;
-    private final RestTemplate restTemplate = new RestTemplate();
-    private static final String VISUALIZER_URL = System.getenv().getOrDefault("VISUALIZER_URL", "");
+    private final AsyncEventService asyncEventService;
 
-    public PaymentController(PaymentProcessorService paymentProcessorService) {
+    public PaymentController(PaymentProcessorService paymentProcessorService,
+                             AsyncEventService asyncEventService) {
         this.paymentProcessorService = paymentProcessorService;
+        this.asyncEventService = asyncEventService;
     }
 
     @PostMapping("/mesh/upload")
-    public ResponseEntity<?> uploadPacket(@Valid @RequestBody MeshPacket packet) {
-        reportToVisualizer("RECEIVED", packet, "Bank received packet");
+    public ResponseEntity<Map<String, String>> uploadPacket(@Valid @RequestBody MeshPacket packet) {
+        asyncEventService.reportToVisualizer("RECEIVED", packet, "Bank received packet");
         try {
             paymentProcessorService.processIncomingPacket(packet);
-            reportToVisualizer("SETTLED", packet, "Transaction settled successfully");
-            return ResponseEntity.ok("Transaction Processed and Settled Successfully!");
+            asyncEventService.reportToVisualizer("SETTLED", packet, "Transaction settled successfully");
+            return ResponseEntity.ok(Map.of("status", "success", "message", "Transaction Processed and Settled Successfully!"));
         } catch (SecurityException e) {
-            e.printStackTrace();
-            reportToVisualizer("REJECTED", packet, "Security Violation: " + e.getMessage());
-            return ResponseEntity.status(403).body("Security Violation: " + e.getMessage());
+            asyncEventService.reportToVisualizer("REJECTED", packet, "Security Violation: " + e.getMessage());
+            return ResponseEntity.status(403).body(Map.of("error", "security_violation", "message", e.getMessage()));
         } catch (Exception e) {
-            e.printStackTrace();
-            reportToVisualizer("REJECTED", packet, "Error: " + e.getMessage());
-            return ResponseEntity.status(500).body("Internal Error: " + e.getMessage());
-        }
-    }
-
-    private void reportToVisualizer(String action, MeshPacket packet, String message) {
-        if (VISUALIZER_URL.isEmpty()) return;
-        try {
-            Map<String, Object> body = new HashMap<>();
-            body.put("node_id", "Bank");
-            body.put("packet_id", packet.getPacketId());
-            body.put("action", action);
-            body.put("ttl", packet.getTtl());
-            body.put("message", message);
-            body.put("timestamp", System.currentTimeMillis());
-            restTemplate.postForEntity(VISUALIZER_URL + "/hop", body, String.class);
-        } catch (Exception ignored) {
+            asyncEventService.reportToVisualizer("REJECTED", packet, "Error: " + e.getMessage());
+            return ResponseEntity.status(500).body(Map.of("error", "internal_error", "message", e.getMessage()));
         }
     }
 }

@@ -5,19 +5,15 @@ import com.offline.payment.model.MeshPacket;
 import com.offline.payment.model.PaymentInstruction;
 
 import javax.crypto.Cipher;
-import javax.crypto.KeyGenerator;
-import javax.crypto.SecretKey;
+import javax.crypto.KeyAgreement;
 import javax.crypto.spec.GCMParameterSpec;
-import javax.crypto.spec.OAEPParameterSpec;
-import javax.crypto.spec.PSource;
+import javax.crypto.spec.SecretKeySpec;
 import java.math.BigDecimal;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
-import java.nio.ByteBuffer;
 import java.security.*;
-import java.security.spec.MGF1ParameterSpec;
 import java.security.spec.X509EncodedKeySpec;
 import java.time.Instant;
 import java.util.Base64;
@@ -26,57 +22,44 @@ import java.util.UUID;
 
 public class TestRunner {
 
-    private static final String RSA_TRANSFORMATION = "RSA/ECB/OAEPWithSHA-256AndMGF1Padding";
-    private static final String AES_TRANSFORMATION = "AES/GCM/NoPadding";
-    private static final int AES_KEY_BITS = 256;
-    private static final int GCM_IV_BYTES = 12;
-    private static final int GCM_TAG_BITS = 128;
-
     public static void main(String[] args) {
         try {
-            System.out.println("🚀 Starting Headless Client Offline UPI Simulation...");
+            System.out.println("Starting Headless Client Offline UPI Simulation...");
             HttpClient client = HttpClient.newHttpClient();
             ObjectMapper mapper = new ObjectMapper();
 
-            // 1. ALICE GENERATES KEYS ON HER PHONE
-            KeyPairGenerator keyGen = KeyPairGenerator.getInstance("RSA");
-            keyGen.initialize(2048);
-            KeyPair aliceKeyPair = keyGen.generateKeyPair();
-            String alicePubKeyBase64 = Base64.getEncoder().encodeToString(aliceKeyPair.getPublic().getEncoded());
+            // 1. ALICE GENERATES Ed25519 + X25519 KEYS
+            KeyPair ed25519Kp = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+            String alicePubKeyBase64 = Base64.getEncoder().encodeToString(ed25519Kp.getPublic().getEncoded());
 
-            // 2. WI-FI ONBOARDING: Register with Bank & Get Bank's Key
-            System.out.println("🌐 [ONLINE] Provisioning Alice's device with the Bank...");
+            // 2. WI-FI ONBOARDING: Register with Bank & Get Bank's Keys
+            System.out.println("[ONLINE] Provisioning Alice's device with the Bank...");
             Map<String, String> provisionReq = Map.of("vpa", "alice@upi", "publicKey", alicePubKeyBase64);
 
             HttpRequest setupRequest = HttpRequest.newBuilder()
                     .uri(URI.create("http://localhost:8080/api/mesh/provision"))
                     .header("Content-Type", "application/json")
+                    .header("X-Sender-Vpa", "alice@upi")
                     .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(provisionReq)))
                     .build();
 
             HttpResponse<String> setupResponse = client.send(setupRequest, HttpResponse.BodyHandlers.ofString());
 
-            // --- NEW SAFETY CHECK ADDED HERE ---
             if (setupResponse.statusCode() != 200) {
-                System.err.println("❌ Provisioning Failed! The Bank Server rejected the setup.");
-                System.err.println("Server HTTP Code: " + setupResponse.statusCode());
-                System.err.println("Server Error Response: " + setupResponse.body());
-                System.err.println("👉 Check your Spring Boot console for the SQL or logic error.");
-                return; // Stop the script gracefully
+                System.err.println("Provisioning Failed! HTTP " + setupResponse.statusCode());
+                System.err.println("Response: " + setupResponse.body());
+                return;
             }
-            // -----------------------------------
 
             Map<?, ?> setupData = mapper.readValue(setupResponse.body(), Map.class);
-            String bankPubKeyBase64 = (String) setupData.get("bankPublicKey");
+            String bankEncryptPubB64 = (String) setupData.get("bankPublicKey");
 
-            // Reconstruct Bank's Public Key from the Base64 string
-            byte[] bankKeyBytes = Base64.getDecoder().decode(bankPubKeyBase64);
-            PublicKey bankPublicKey = KeyFactory.getInstance("RSA").generatePublic(new X509EncodedKeySpec(bankKeyBytes));
-            System.out.println("✅ Provisioning Complete. Acquired Bank Public Key.");
+            byte[] bankKeyBytes = Base64.getDecoder().decode(bankEncryptPubB64);
+            PublicKey bankEncryptPub = KeyFactory.getInstance("X25519").generatePublic(new X509EncodedKeySpec(bankKeyBytes));
+            System.out.println("Provisioning Complete. Acquired Bank X25519 Public Key.");
 
-            // ---------------------------------------------------------
-            // 3. PHASE 1: ALICE WRITES AN OFFLINE TRANSACTION
-            System.out.println("\n📱 [OFFLINE] Alice initiating offline payment of ₹500.00 to Bob...");
+            // 3. ALICE WRITES AN OFFLINE TRANSACTION
+            System.out.println("\n[OFFLINE] Alice initiating offline payment of 500.00 to Bob...");
             PaymentInstruction instruction = new PaymentInstruction(
                     "alice@upi", "bob@upi", new BigDecimal("500.00"),
                     "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918",
@@ -85,34 +68,39 @@ public class TestRunner {
 
             byte[] plaintextBytes = mapper.writeValueAsBytes(instruction);
 
-            // 4. HYBRID ENCRYPTION (Using the REAL Bank Public Key)
-            KeyGenerator aesKeyGen = KeyGenerator.getInstance("AES");
-            aesKeyGen.init(AES_KEY_BITS);
-            SecretKey temporaryAesKey = aesKeyGen.generateKey();
+            // 4. HYBRID ENCRYPTION with X25519 ECDH + AES-GCM
+            KeyPair ephemeralX25519 = KeyPairGenerator.getInstance("X25519").generateKeyPair();
 
-            byte[] iv = new byte[GCM_IV_BYTES];
+            KeyAgreement ka = KeyAgreement.getInstance("X25519");
+            ka.init(ephemeralX25519.getPrivate());
+            ka.doPhase(bankEncryptPub, true);
+            byte[] sharedSecret = ka.generateSecret();
+
+            byte[] iv = new byte[12];
             new SecureRandom().nextBytes(iv);
-            Cipher aesCipher = Cipher.getInstance(AES_TRANSFORMATION);
-            aesCipher.init(Cipher.ENCRYPT_MODE, temporaryAesKey, new GCMParameterSpec(GCM_TAG_BITS, iv));
+
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            md.update("upi-aes-key-derivation".getBytes());
+            md.update(sharedSecret);
+            md.update(iv);
+            byte[] aesKey = md.digest();
+
+            Cipher aesCipher = Cipher.getInstance("AES/GCM/NoPadding");
+            aesCipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(aesKey, "AES"), new GCMParameterSpec(128, iv));
             byte[] encryptedPayload = aesCipher.doFinal(plaintextBytes);
 
-            Cipher rsaCipher = Cipher.getInstance(RSA_TRANSFORMATION);
-            rsaCipher.init(Cipher.ENCRYPT_MODE, bankPublicKey); // Removed the explicit OAEP spec to match backend!
-            byte[] encryptedAesKey = rsaCipher.doFinal(temporaryAesKey.getEncoded());
+            String ciphertextBase64 = Base64.getUrlEncoder().withoutPadding().encodeToString(ephemeralX25519.getPublic().getEncoded()) + ":" +
+                    Base64.getUrlEncoder().withoutPadding().encodeToString(iv) + ":" +
+                    Base64.getUrlEncoder().withoutPadding().encodeToString(encryptedPayload);
 
-            // Pack into a colon-separated string matching the backend's exact format: IV:Key:Payload
-            String ciphertextBase64 = Base64.getEncoder().encodeToString(iv) + ":" +
-                    Base64.getEncoder().encodeToString(encryptedAesKey) + ":" +
-                    Base64.getEncoder().encodeToString(encryptedPayload);
+            System.out.println("Payload encrypted with X25519 ECDH + AES-GCM.");
 
-            System.out.println("🔒 Payload encrypted into Hybrid Ciphertext Safe (Formatted perfectly!).");
-
-            // 5. DIGITAL SIGNATURE
-            Signature signatureEngine = Signature.getInstance("SHA256withRSA");
-            signatureEngine.initSign(aliceKeyPair.getPrivate());
-            signatureEngine.update(ciphertextBase64.getBytes());
-            String signatureBase64 = Base64.getEncoder().encodeToString(signatureEngine.sign());
-            System.out.println("🔏 Wax seal signature applied.");
+            // 5. Ed25519 DIGITAL SIGNATURE
+            Signature sigEngine = Signature.getInstance("Ed25519");
+            sigEngine.initSign(ed25519Kp.getPrivate());
+            sigEngine.update(ciphertextBase64.getBytes());
+            String signatureBase64 = Base64.getEncoder().encodeToString(sigEngine.sign());
+            System.out.println("Ed25519 signature applied.");
 
             // 6. PACK THE ENVELOPE
             MeshPacket packet = new MeshPacket();
@@ -123,11 +111,12 @@ public class TestRunner {
             packet.setSenderVpa("alice@upi");
             packet.setSignature(signatureBase64);
 
-            // 7. DAVE TRANSMITS VIA 5G
-            System.out.println("\n📡 [ONLINE] Dave found network! Uploading transaction packet...");
+            // 7. TRANSMIT
+            System.out.println("\n[ONLINE] Uploading transaction packet...");
             HttpRequest uploadRequest = HttpRequest.newBuilder()
                     .uri(URI.create("http://localhost:8080/api/mesh/upload"))
                     .header("Content-Type", "application/json")
+                    .header("X-Sender-Vpa", "alice@upi")
                     .header("X-Bridge-Node-Id", "phone-dave-gateway")
                     .header("X-Hop-Count", "2")
                     .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(packet)))
@@ -135,12 +124,12 @@ public class TestRunner {
 
             HttpResponse<String> uploadResponse = client.send(uploadRequest, HttpResponse.BodyHandlers.ofString());
 
-            System.out.println("\n📥 Server Response Received! Code: " + uploadResponse.statusCode());
-            System.out.println("💬 Response Payload: " + uploadResponse.body());
-            System.out.println("\n🏁 Simulation completed successfully. Payment Successfully Completed!..");
+            System.out.println("\nServer Response! Code: " + uploadResponse.statusCode());
+            System.out.println("Body: " + uploadResponse.body());
+            System.out.println("\nSimulation completed successfully!");
 
         } catch (Exception e) {
-            System.err.println("❌ Critical Simulation Error: " + e.getMessage());
+            System.err.println("Critical Simulation Error: " + e.getMessage());
             e.printStackTrace();
         }
     }

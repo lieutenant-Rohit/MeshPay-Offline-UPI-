@@ -136,7 +136,7 @@ Alice's Laptop              Docker Mesh Nodes                  Bank Server
        │  Sign SHA256withRSA       │                               │
        │  Set TTL=10               │                               │
        │                           │                               │
-       │─── POST /receive ───────▶ │                                │
+       │─── POST /receive ───────▶ │                               │
        │                           │  greedy nearest to bank       │
        │                           │  TTL 10→9, forward            │
        │                           │      │ (neighbor closest      │
@@ -156,7 +156,7 @@ Alice's Laptop              Docker Mesh Nodes                  Bank Server
        │                           │    8. Transfer ₹500           │
        │                           │    9. Audit record            │
        │                           │    ─── ✅ SETTLED ──          │
-       │◀─── nested response ────│◀─────────────────────────────── │
+       │◀─── nested response ────  │◀──────────────────────────────│
 ```
 
 Every node (and the bank) reports each step to the visualizer in real-time:
