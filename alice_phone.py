@@ -17,11 +17,12 @@ import time
 import uuid
 import os
 import sys
+from typing import Any, cast
 import requests
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, RSAPublicKey
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.backends import default_backend
 
 BANK_URL   = "http://localhost:8080"
 MESH_ENTRY = "http://localhost:5001"
@@ -43,12 +44,12 @@ else:
 if os.path.exists(KEY_FILE):
     print("🔑 Loaded EXISTING keys for Alice from disk.")
     with open(KEY_FILE, "rb") as f:
-        alice_private_key = serialization.load_pem_private_key(
-            f.read(), password=None, backend=default_backend())
+        alice_private_key = cast(RSAPrivateKey, serialization.load_pem_private_key(
+            f.read(), password=None))
 else:
     print("🔑 Generating NEW keys for Alice and saving to disk...")
-    alice_private_key = rsa.generate_private_key(
-        public_exponent=65537, key_size=2048, backend=default_backend())
+    alice_private_key = cast(RSAPrivateKey, rsa.generate_private_key(
+        public_exponent=65537, key_size=2048))
     with open(KEY_FILE, "wb") as f:
         f.write(alice_private_key.private_bytes(
             encoding=serialization.Encoding.PEM,
@@ -76,8 +77,8 @@ print("✅ Provision response:", json.dumps(provision_data, indent=2))
 # The server generates a fresh RSA keypair on every boot, so any static constant
 # becomes invalid after a restart.
 bank_pub_b64 = provision_data["bankPublicKey"]
-bank_pub_key = serialization.load_der_public_key(
-    base64.b64decode(bank_pub_b64), backend=default_backend())
+bank_pub_key = cast(RSAPublicKey, serialization.load_der_public_key(
+    base64.b64decode(bank_pub_b64)))
 
 
 # ── 3. Provision Bob (so his account exists as the receiver) ────────────────
@@ -86,11 +87,11 @@ print(f"\n📡 Provisioning Bob ({BOB_VPA}) with the bank server...")
 bob_key_file = "bob_private.pem"
 if os.path.exists(bob_key_file):
     with open(bob_key_file, "rb") as f:
-        bob_private_key = serialization.load_pem_private_key(
-            f.read(), password=None, backend=default_backend())
+        bob_private_key = cast(RSAPrivateKey, serialization.load_pem_private_key(
+            f.read(), password=None))
 else:
-    bob_private_key = rsa.generate_private_key(
-        public_exponent=65537, key_size=2048, backend=default_backend())
+    bob_private_key = cast(RSAPrivateKey, rsa.generate_private_key(
+        public_exponent=65537, key_size=2048))
     with open(bob_key_file, "wb") as f:
         f.write(bob_private_key.private_bytes(
             encoding=serialization.Encoding.PEM,
@@ -163,7 +164,7 @@ signature_b64 = base64.b64encode(signature).decode()
 
 # ── 7. Assemble the MeshPacket ───────────────────────────────────────────────
 
-mesh_packet = {
+mesh_packet: dict[str, Any] = {
     "packetId":  f"PKT_{str(uuid.uuid4())[:8].upper()}",
     "ttl":        10,
     "createdAt":  current_millis,
