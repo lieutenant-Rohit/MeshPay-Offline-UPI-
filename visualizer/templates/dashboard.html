@@ -78,12 +78,16 @@ body{
 .log-entry .action.settled{color:#d2a8ff}
 .log-entry .action.rejected{color:#f85149}
 .log-entry .action.end_of_line{color:#8b949e}
+.log-entry .action.perimeter{color:#f0883e}
+.log-entry .action.greedy_restore{color:#ffd700}
 .log-entry.received{border-left-color:#00ff88}
 .log-entry.forwarded{border-left-color:#58a6ff}
 .log-entry.dropped{border-left-color:#f85149}
 .log-entry.settled{border-left-color:#d2a8ff}
 .log-entry.rejected{border-left-color:#f85149}
 .log-entry.end_of_line{border-left-color:#8b949e}
+.log-entry.perimeter{border-left-color:#f0883e}
+.log-entry.greedy_restore{border-left-color:#ffd700}
 .log-entry .msg{color:#484f58;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
 #empty-state{
   display:flex;flex-direction:column;align-items:center;justify-content:center;
@@ -234,13 +238,15 @@ function drawEdge(idFrom, idTo, active, dashed, w, h) {
   }
 }
 
-function drawNode(id, active, error, settled, pulse, w, h) {
+function drawNode(id, active, error, settled, pulse, w, h, extra) {
   const p = nodePos(id, w, h);
   const x = p.x, y = p.y;
   const r = NODE_RADIUS;
+  extra = extra || {};
+
+  const glowColor = settled ? '#d2a8ff' : (extra.perimeter ? '#f0883e' : (extra.greedyRestore ? '#ffd700' : '#00ff88'));
 
   if (active && pulse > 0) {
-    const glowColor = settled ? '#d2a8ff' : '#00ff88';
     const expand = r * (1 + pulse * 0.6);
     const g = ctx.createRadialGradient(x, y, r, x, y, expand);
     g.addColorStop(0, `${glowColor}${Math.round(0.15 * (1 - pulse) * 255).toString(16).padStart(2,'0')}`);
@@ -252,17 +258,19 @@ function drawNode(id, active, error, settled, pulse, w, h) {
   const grad = ctx.createRadialGradient(x - r*0.25, y - r*0.25, 0, x, y, r);
   if (settled) { grad.addColorStop(0,'#d2a8ff'); grad.addColorStop(1,'#6b3fa0'); }
   else if (error) { grad.addColorStop(0,'#f85149'); grad.addColorStop(1,'#8b1515'); }
+  else if (extra.perimeter) { grad.addColorStop(0,'#f0883e'); grad.addColorStop(1,'#8a4a1a'); }
+  else if (extra.greedyRestore) { grad.addColorStop(0,'#ffd700'); grad.addColorStop(1,'#8a7500'); }
   else if (active) { grad.addColorStop(0,'#00ff88'); grad.addColorStop(1,'#006644'); }
   else { grad.addColorStop(0,'#1e2a4a'); grad.addColorStop(1,'#0d1117'); }
 
-  ctx.shadowColor = settled ? '#d2a8ff' : (active ? '#00ff88' : 'transparent');
+  ctx.shadowColor = glowColor;
   ctx.shadowBlur = active ? 16 + Math.sin(Date.now()/300)*6 : 0;
   ctx.fillStyle = grad;
   ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.fill();
   ctx.shadowBlur = 0;
 
-  ctx.strokeStyle = settled ? '#d2a8ff' : (active ? '#00ff88' : '#1e2a3a');
-  ctx.lineWidth = active || settled ? 2.5 : 1;
+  ctx.strokeStyle = glowColor;
+  ctx.lineWidth = active || settled || extra.perimeter || extra.greedyRestore ? 2.5 : 1;
   ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.stroke();
 
   const icon = id === 'Bank' ? '🏦' : '📱';
@@ -270,7 +278,7 @@ function drawNode(id, active, error, settled, pulse, w, h) {
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   ctx.fillText(icon, x, y - 1);
 
-  ctx.fillStyle = settled ? '#d2a8ff' : (active ? '#00ff88' : '#8b949e');
+  ctx.fillStyle = glowColor;
   ctx.font = 'bold 11px "Courier New",monospace';
   ctx.textBaseline = 'top';
   ctx.fillText(id, x, y + r + 10);
@@ -280,6 +288,16 @@ function drawNode(id, active, error, settled, pulse, w, h) {
     ctx.font = '8px "Courier New",monospace';
     ctx.textBaseline = 'top';
     ctx.fillText('✓ SETTLED', x, y + r + 24);
+  } else if (extra.perimeter) {
+    ctx.fillStyle = 'rgba(240,136,62,0.5)';
+    ctx.font = '8px "Courier New",monospace';
+    ctx.textBaseline = 'top';
+    ctx.fillText('⟳ PERIMETER', x, y + r + 24);
+  } else if (extra.greedyRestore) {
+    ctx.fillStyle = 'rgba(255,215,0,0.5)';
+    ctx.font = '8px "Courier New",monospace';
+    ctx.textBaseline = 'top';
+    ctx.fillText('↻ GREEDY', x, y + r + 24);
   }
 }
 
@@ -363,6 +381,16 @@ function processEvent(evt) {
 
   if (action === 'REJECTED') {
     nodePulses[node_id] = { start: Date.now(), error: true, active: true };
+  }
+
+  if (action === 'PERIMETER') {
+    activeNodes.add(node_id);
+    nodePulses[node_id] = { start: Date.now(), active: true, perimeter: true };
+  }
+
+  if (action === 'GREEDY_RESTORE') {
+    activeNodes.add(node_id);
+    nodePulses[node_id] = { start: Date.now(), active: true, greedyRestore: true };
   }
 
   if (action === 'SETTLED') {
@@ -468,17 +496,21 @@ function render() {
     let pulseVal = 0;
     let error = false;
     let settled = false;
+    let extra = {};
     if (pulse) {
       const elapsed = Date.now() - pulse.start;
       if (pulse.error) error = true;
       if (pulse.settled) settled = true;
+      if (pulse.perimeter) extra.perimeter = true;
+      if (pulse.greedyRestore) extra.greedyRestore = true;
       if (elapsed < 1200) {
         pulseVal = 1 - elapsed / 1200;
       } else {
-        if (!pulse.error && !pulse.settled) pulseVal = 0.15 + Math.sin(Date.now() / 600 + NODE_LIST.indexOf(node)) * 0.08;
+        if (!pulse.error && !pulse.settled && !pulse.perimeter && !pulse.greedyRestore)
+          pulseVal = 0.15 + Math.sin(Date.now() / 600 + NODE_LIST.indexOf(node)) * 0.08;
       }
     }
-    drawNode(node, active, error, settled, pulseVal, w, h);
+    drawNode(node, active, error, settled, pulseVal, w, h, extra);
   }
 
   requestAnimationFrame(render);

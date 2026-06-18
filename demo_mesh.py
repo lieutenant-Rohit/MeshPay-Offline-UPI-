@@ -15,6 +15,7 @@ MESH_ENTRY = "http://localhost:5001/receive"
 PACKET = {
     "packetId": f"PKT_DEMO_{str(uuid.uuid4())[:8].upper()}",
     "ttl": 10,
+    "mode": "greedy",
     "createdAt": int(time.time() * 1000),
     "senderVpa": "alice@bank",
     "signature": "DEMO_SIGNATURE_FOR_VISUALIZATION",

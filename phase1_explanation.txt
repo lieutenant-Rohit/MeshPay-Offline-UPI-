@@ -1,0 +1,237 @@
+PHASE 1: INFRASTRUCTURE & CONFIG
+===================================
+
+Files:
+  1. mesh-topology.json
+  2. docker-compose.yml
+  3. Dockerfile (root — Java bank)
+  4. phone-node/Dockerfile
+  5. pom.xml
+
+====================================================================
+1. mesh-topology.json
+====================================================================
+
+This file defines the entire mesh network layout.
+
+{
+  "nodes": [
+    {"id": "Node-1", "x": 0, "y": 0},
+    ...
+    {"id": "Bank", "x": 400, "y": 450}
+  ],
+
+  "neighbors": {
+    "Node-1": ["Node-2", "Node-4", "Node-5"],
+    ...
+    "Bank": []
+  },
+
+  "bankUrl": "http://spring-bank-1:8080/api/mesh/upload",
+
+  "bankNodeId": "Bank",
+
+  "nodeUrls": {
+    "Node-1":  "http://node-1-alice:5001",
+    ...
+    "Bank":    "http://spring-bank-1:8080/api/mesh/upload"
+  }
+}
+
+KEY SECTIONS:
+
+nodes[]
+  - Every phone node and the Bank have an (x, y) coordinate.
+  - Greedy routing uses these coordinates to compute Euclidean distance.
+  - Node-1 = Alice's entry point (port 5001 on host).
+  - Node-10 = gateway node, closest to the Bank.
+  - "Bank" is a virtual node (no actual service at that position).
+
+neighbors{}
+  - Key = node ID, Value = list of neighbor node IDs.
+  - Node-5 is the most connected (8 neighbors — center of grid).
+  - "Bank" has no neighbors (it's a destination marker, not a router).
+  - The routing algorithm: from current node, pick the neighbor with
+    smallest Euclidean distance to the Bank position.
+
+bankUrl
+  - The actual HTTP endpoint where mesh nodes forward packets to the bank.
+  - Points to spring-bank-1 (the Docker service name, not localhost).
+  - Port 8080 is the internal port (maps to 8081 on your host machine).
+
+nodeUrls{}
+  - Each node's internal Docker network address.
+  - Node-1 is "node-1-alice" (the Docker service name).
+  - "Bank" entry = same as bankUrl — used when Node-10 decides to
+    send directly to the bank.
+
+WHY THIS FORMAT?
+  - JSON = easy to edit, no code recompile needed.
+  - Mounted as a volume in Docker → change the file, restart nodes.
+  - Greedy routing is topology-agnostic: add/remove nodes by editing
+    this file, no Python code changes needed.
+
+====================================================================
+2. docker-compose.yml
+====================================================================
+
+This is the orchestration file — defines every container.
+
+SERVICE BREAKDOWN:
+
+postgres:
+  - image: postgres:16-alpine       # Lightweight PostgreSQL
+  - DB name: paymentdb
+  - User: payment_user / payment_pass
+  - Port 5432 exposed to host (for debugging with psql/pgAdmin)
+  - healthcheck: pg_isready — Docker waits for this before starting banks
+  - Volume pgdata persists DB data across restarts
+
+redis:
+  - image: redis:7-alpine
+  - Port 6379 exposed
+  - healthcheck: redis-cli ping
+  - Used for: user cache, replay hash cache, rate limiting counters
+
+visualizer:
+  - build: ./visualizer             # Uses Dockerfile in visualizer/
+  - Port 5002 → 5002 (HTML dashboard)
+  - No dependencies — runs standalone
+
+spring-bank-1, spring-bank-2, spring-bank-3:
+  - build: .                        # Uses root Dockerfile (Java)
+  - Ports: 8081→8080, 8082→8080, 8083→8080
+    (host:container — each bank thinks it's on port 8080)
+  - Environment variables:
+    * SERVER_PORT=8080               # Java -Dserver.port
+    * VISUALIZER_URL=http://visualizer:5002
+    * PAYMENT_RATELIMIT_PER_VPA=100000
+    * PAYMENT_RATELIMIT_GLOBAL=500000
+    (rates overridden from application.properties defaults)
+  - depends_on: postgres & redis (healthcheck — waits for both)
+  - All 3 share the SAME postgres + redis (single DB bottleneck)
+
+node-1-alice through node-10-gateway:
+  - build: ./phone-node             # Uses Dockerfile in phone-node/
+  - Only node-1-alice exposes port 5001 (external entry point)
+  - Each has NODE_ID env var (Node-1, Node-2, ... Node-10)
+  - VISUALIZER_URL so nodes report hops to visualizer
+  - Volume mount: mesh-topology.json mounted read-only (:ro)
+    * Changes to the file on host are visible inside containers (no rebuild)
+  - node-10-gateway depends on spring-bank-1 (ensures bank starts first)
+
+volumes:
+  pgdata: — named volume for PostgreSQL persistence
+
+networks:
+  mesh-net: — bridge network (default) — all containers can reach
+              each other by service name
+
+KEY POINT:
+  Internal Docker DNS means services talk by name:
+    - Bank-1 is reachable as "spring-bank-1" (not localhost)
+    - Node-1 is reachable as "node-1-alice"
+    - Postgres is reachable as "postgres"
+  This is why mesh-topology.json uses service names, not localhost.
+
+====================================================================
+3. Dockerfile (root — Java Bank)
+====================================================================
+
+Two-stage build for smaller final image:
+
+STAGE 1 (builder):
+  FROM maven:3.9.6-eclipse-temurin-21
+  WORKDIR /app
+  COPY pom.xml .                     # Copy only POM first
+  RUN mvn dependency:go-offline -B   # Download ALL Maven dependencies
+                                     # (cached layer — only re-runs if pom.xml changes)
+  COPY src ./src                     # Copy source code
+  RUN mvn clean package -DskipTests  # Build the JAR (skips tests)
+
+STAGE 2 (runtime):
+  FROM eclipse-temurin:21-jre-alpine # Smaller JRE (no compiler)
+  RUN addgroup -S spring && adduser -S spring -G spring
+  USER spring:spring                 # Run as non-root (security best practice)
+  WORKDIR /app
+  COPY --from=builder /app/target/payment-0.0.1-SNAPSHOT.jar app.jar
+  EXPOSE 8080
+
+  ENV JAVA_OPTS="..."
+    -Xms2g -Xmx2g                   # 2GB heap min/max
+    -XX:+UseG1GC                    # G1 garbage collector (low pause)
+    -XX:MaxGCPauseMillis=100        # Target max 100ms GC pause
+    -XX:+UseStringDeduplication     # Dedup identical strings in heap
+    -XX:+HeapDumpOnOutOfMemoryError # Auto heap dump on OOM
+
+  ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar app.jar"]
+
+WHY TWO STAGES?
+  - Stage 1 has Maven + JDK (heavy, 700MB+)
+  - Stage 2 has only JRE (lighter, ~180MB)
+  - Final image is ~200MB instead of 800MB+.
+
+====================================================================
+4. phone-node/Dockerfile
+====================================================================
+
+FROM python:3.11-slim               # Official Python image
+WORKDIR /app
+COPY requirements.txt .              # Flask + requests
+RUN pip install --no-cache-dir -r requirements.txt
+COPY node.py .                       # The mesh routing logic
+EXPOSE 5001
+CMD ["python", "node.py"]
+
+WHY SO SIMPLE?
+  - Mesh nodes are stateless Flask apps
+  - No database, no complex dependencies
+  - The mesh-topology.json is mounted as a volume at runtime
+    (not copied in during build)
+
+====================================================================
+5. pom.xml
+====================================================================
+
+Maven Project Object Model — defines Java project + dependencies.
+
+Key sections:
+
+<parent>
+  spring-boot-starter-parent 3.2.5
+  — Inherits Spring Boot defaults (Java version, plugin config, etc.)
+
+<properties>
+  java.version=21
+  — Uses Java 21 features (records, sealed classes, virtual threads)
+
+<dependencies>
+  spring-boot-starter-web          — REST controllers, embedded Tomcat
+  spring-boot-starter-data-jpa     — Hibernate ORM + JPA
+  spring-boot-starter-data-redis   — Redis client (Lettuce)
+  spring-boot-starter-aop          — Aspect-Oriented Programming
+                                     (used by RateLimitingAspect)
+  spring-boot-starter-actuator     — /actuator/health, /metrics, etc.
+  postgresql (runtime)             — PostgreSQL JDBC driver
+                                     (not needed at compile time)
+  lombok                          — @Data, @Builder annotations
+                                     (auto-generates getters/setters)
+
+  test:
+    spring-boot-starter-test       — JUnit 5, Mockito, AssertJ
+    h2 (test)                      — In-memory DB for unit tests
+                                     (tests don't need PostgreSQL)
+
+<build>
+  spring-boot-maven-plugin         — Packages as executable JAR
+
+WHY THESE DEPENDENCIES?
+  - web → REST API
+  - data-jpa → database access
+  - data-redis → caching + rate limiting
+  - aop → aspect for rate limiting
+  - actuator → health checks
+  - lombok → less boilerplate
+
+====================================================================
+END OF PHASE 1

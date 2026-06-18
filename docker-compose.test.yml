@@ -1,0 +1,56 @@
+services:
+  spring-bank-1:
+    environment:
+      - JAVA_OPTS=-Xms512m -Xmx512m -XX:+UseG1GC -XX:MaxGCPauseMillis=100 -XX:+ParallelRefProcEnabled -XX:+UseStringDeduplication -XX:MetaspaceSize=128m -XX:MaxMetaspaceSize=128m -Djava.security.egd=file:/dev/./urandom
+    mem_limit: 768m
+
+  spring-bank-2:
+    build: .
+    ports:
+      - "8082:8080"
+    environment:
+      - SERVER_PORT=8080
+      - VISUALIZER_URL=http://visualizer:5002
+      - PAYMENT_RATELIMIT_PER_VPA=100000
+      - PAYMENT_RATELIMIT_PER_VPA_WINDOW_SECONDS=60
+      - PAYMENT_RATELIMIT_GLOBAL=500000
+      - PAYMENT_RATELIMIT_GLOBAL_WINDOW_SECONDS=60
+      - JAVA_OPTS=-Xms512m -Xmx512m -XX:+UseG1GC -XX:MaxGCPauseMillis=100 -XX:+ParallelRefProcEnabled -XX:+UseStringDeduplication -XX:MetaspaceSize=128m -XX:MaxMetaspaceSize=128m -Djava.security.egd=file:/dev/./urandom
+    mem_limit: 768m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - mesh-net
+
+  spring-bank-3:
+    build: .
+    ports:
+      - "8083:8080"
+    environment:
+      - SERVER_PORT=8080
+      - VISUALIZER_URL=http://visualizer:5002
+      - PAYMENT_RATELIMIT_PER_VPA=100000
+      - PAYMENT_RATELIMIT_PER_VPA_WINDOW_SECONDS=60
+      - PAYMENT_RATELIMIT_GLOBAL=500000
+      - PAYMENT_RATELIMIT_GLOBAL_WINDOW_SECONDS=60
+      - JAVA_OPTS=-Xms512m -Xmx512m -XX:+UseG1GC -XX:MaxGCPauseMillis=100 -XX:+ParallelRefProcEnabled -XX:+UseStringDeduplication -XX:MetaspaceSize=128m -XX:MaxMetaspaceSize=128m -Djava.security.egd=file:/dev/./urandom
+    mem_limit: 768m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - mesh-net
+
+  postgres:
+    mem_limit: 512m
+
+  redis:
+    mem_limit: 256m
+
+  visualizer:
+    mem_limit: 256m
