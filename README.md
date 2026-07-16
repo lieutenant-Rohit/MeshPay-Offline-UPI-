@@ -187,21 +187,21 @@ Every node (and the bank) reports each step to the visualizer in real-time:
 
 ---
 
-## Security Pipeline (8 Checks)
+## Security Pipeline (7 Checks)
 
 ```
  1. Replay?     → SHA-256(ciphertext) already in DB?    → REJECT
  2. Known user? → senderVpa registered?                  → REJECT
- 3. Tampered?   → RSA signature valid?                   → REJECT
- 4. Decrypt?    → RSA unwrap + AES-GCM decrypt?          → REJECT
+ 3. Tampered?   → Ed25519 signature valid?               → REJECT
+ 4. Decrypt?    → X25519 ECDH + AES-GCM decrypt?        → REJECT
  5. Spoofed?    → outer VPA == inner VPA?                → REJECT
- 6. Too old?    → signedAt within 24 hours?               → REJECT
- 7. Has funds?  → sufficient balance?                     → REJECT
+ 6. Too old?    → signedAt within 24 hours?              → REJECT
+ 7. Has funds?  → sufficient balance?                    → REJECT
  8. Audit       → persist Transaction →                  ✅ SETTLED
 ```
 
-- **Hybrid encryption**: AES-256-GCM payload, RSA-2048 OAEP key wrap (MGF1 SHA-256)
-- **Digital signature**: SHA256withRSA, PKCS#1 v1.5 padding
+- **Hybrid encryption**: AES-256-GCM payload, X25519 ECDH key exchange
+- **Digital signature**: Ed25519
 - **TTL**: hop-limit prevents infinite loops
 - **Replay protection**: duplicate packet hash rejected instantly
 - **Fresh keypair**: bank generates new RSA keypair on every boot
@@ -213,16 +213,16 @@ Every node (and the bank) reports each step to the visualizer in real-time:
 ```
 payment/
 ├── mesh-topology.json           # 10-node grid positions, neighbors, URLs
-├── docker-compose.yml           # 12 containers: visualizer + bank + 10 nodes
-├── Dockerfile                   # Spring Boot bank build
+├── docker-compose.yml           # 12 containers: visualizer + bank + 10 mesh nodes
+├── Dockerfile                   # Spring Boot bank build (multi-stage)
 │
 ├── src/main/java/.../           # Bank server (Java 21 + Spring Boot 3.2)
 │   ├── PaymentController.java        # POST /api/mesh/upload
 │   ├── TestProvisionController.java  # POST /api/mesh/provision
-│   ├── PaymentProcessorService.java  # 8-step security pipeline
+│   ├── PaymentProcessorService.java  # 7-step security pipeline
 │   ├── LedgerService.java            # Fund transfer logic
-│   ├── HybridCryptoService.java      # AES-256-GCM + RSA-OAEP
-│   ├── SignatureService.java         # SHA256withRSA verification
+│   ├── HybridCryptoService.java      # AES-256-GCM + X25519 ECDH
+│   ├── SignatureService.java         # Ed25519 signature verification
 │   ├── model/                        # MeshPacket, Transaction, User, Account, etc.
 │   └── config/DataInitializer.java   # Demo data seeding
 │
@@ -279,11 +279,11 @@ payment/
 
 | Component | Technology |
 |-----------|-----------|
-| Bank Server | Java 21, Spring Boot 3.2.5, H2, Maven |
+| Bank Server | Java 21, Spring Boot 3.2.5, PostgreSQL, Maven |
 | Mesh Nodes | Python 3.11, Flask |
 | Visualizer | Python 3.11, Flask, HTML5 Canvas, SSE |
 | Orchestration | Docker Compose |
-| Crypto | RSA-2048, AES-256-GCM, SHA-256, SHA256withRSA |
+| Crypto | Ed25519, X25519 ECDH, AES-256-GCM, SHA-256 |
 
 ---
 

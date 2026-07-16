@@ -1,6 +1,5 @@
 package com.offline.payment.controller;
 
-import com.offline.payment.config.CacheService;
 import com.offline.payment.model.Account;
 import com.offline.payment.model.User;
 import com.offline.payment.repository.AccountRepository;
@@ -18,26 +17,19 @@ public class TestProvisionController {
     private final UserRepository userRepository;
     private final AccountRepository accountRepository;
     private final ServerKeyHolder serverKeyHolder;
-    private final CacheService cacheService;
 
     public TestProvisionController(UserRepository userRepository,
                                    AccountRepository accountRepository,
-                                   ServerKeyHolder serverKeyHolder,
-                                   CacheService cacheService) {
+                                   ServerKeyHolder serverKeyHolder) {
         this.userRepository = userRepository;
         this.accountRepository = accountRepository;
         this.serverKeyHolder = serverKeyHolder;
-        this.cacheService = cacheService;
     }
 
     @PostMapping("/mesh/provision")
     public Map<String, String> provisionDevice(@RequestBody Map<String, String> request) {
         String userVpa = request.get("vpa");
         String userPublicKey = request.get("publicKey");
-
-        // Evict stale caches so re-provisioning picks up new keys
-        cacheService.evictUser(userVpa);
-        cacheService.evictAccount(userVpa);
 
         User user = userRepository.findById(userVpa).orElseGet(User::new);
         user.setVpa(userVpa);

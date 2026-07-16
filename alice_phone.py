@@ -163,7 +163,7 @@ upload_resp = requests.post(
     timeout=30)
 
 print(f"\n{'OK' if upload_resp.ok else 'FAIL'} Server response [{upload_resp.status_code}]:")
-print(upload_resp.text)
+print(json.dumps(upload_resp.json(), indent=2))
 
 if not upload_resp.ok:
     print("\nPacket rejected. Check server logs for details.")

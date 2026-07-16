@@ -1,6 +1,5 @@
 package com.offline.payment.service;
 
-import com.offline.payment.config.CacheService;
 import com.offline.payment.repository.AccountRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -11,11 +10,9 @@ import java.math.BigDecimal;
 public class LedgerService {
 
     private final AccountRepository accountRepository;
-    private final CacheService cacheService;
 
-    public LedgerService(AccountRepository accountRepository, CacheService cacheService) {
+    public LedgerService(AccountRepository accountRepository) {
         this.accountRepository = accountRepository;
-        this.cacheService = cacheService;
     }
 
     @Transactional
@@ -29,7 +26,5 @@ public class LedgerService {
             accountRepository.atomicCredit(senderVpa, amount);
             throw new RuntimeException("Receiver account not found: " + receiverVpa);
         }
-        cacheService.evictAccount(senderVpa);
-        cacheService.evictAccount(receiverVpa);
     }
 }

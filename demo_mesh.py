@@ -22,25 +22,37 @@ PACKET = {
     "ciphertext": "DEMO_CIPHERTEXT_FOR_VISUALIZATION",
 }
 
-print("╔══════════════════════════════════════════════════════╗")
-print("║     UPI MESH PACKET VISUALIZER — DEMO               ║")
-print("╠══════════════════════════════════════════════════════╣")
-print(f"║  Packet ID : {PACKET['packetId']}")
-print(f"║  TTL       : {PACKET['ttl']}")
-print(f"║  Entry     : Node-1 (port 5001)")
-print("║                                                    ║")
-print("║  Open your browser to:                              ║")
-print("║  ► http://localhost:5002                             ║")
-print("╚══════════════════════════════════════════════════════╝")
+print("  ╔══════════════════════════════════════════════════════╗")
+print("  ║     UPI MESH PACKET VISUALIZER — DEMO                ║")
+print("  ╠══════════════════════════════════════════════════════╣")
+print(f" ║  Packet ID : {PACKET['packetId']:<47}                ║")
+print(f" ║  TTL       : {PACKET['ttl']:<47}                     ║")
+print(f" ║  Entry     : Node-1 (port 5001)                      ║")
+print("  ║                                                      ║")
+print("  ║  Open your browser to:                               ║")
+print("  ║  ► http://localhost:5002                             ║")
+print("  ╚══════════════════════════════════════════════════════╝")
 
 resp = requests.post(MESH_ENTRY, json=PACKET, timeout=30)
 result = resp.json()
 
-print(f"\n{'✅' if resp.ok else '❌'} Mesh response [{resp.status_code}]:")
-print(json.dumps(result, indent=2))
+# Flatten nested response into a clean route path
+path = []
+def flatten(d):
+    if isinstance(d, dict):
+        s = d.get("status", "")
+        if "Forwarded" in s:
+            path.append(s.replace("Forwarded by ", "").replace(" to ", " --> "))
+        elif "success" in d.get("status", ""):
+            path.append("✅ SETTLED")
+        elif "error" in d:
+            path.append("⚠️  Rejected (demo signature)")
+        if "downstream_response" in d:
+            flatten(d["downstream_response"])
+flatten(result)
 
-if resp.ok:
-    print("\n🎯 Packet traversed the mesh! Check the visualizer.")
-else:
-    print("\n⚠️  Packet was rejected (expected if using demo signature).")
-    print("   The visualizer still shows the mesh hops!")
+print("")
+print("  🌐 Mesh Route:")
+for p in path:
+    print(f"     {p}")
+print(f"  📺 http://localhost:5002")

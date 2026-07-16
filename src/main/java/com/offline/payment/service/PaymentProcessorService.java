@@ -1,6 +1,5 @@
 package com.offline.payment.service;
 
-import com.offline.payment.config.CacheService;
 import com.offline.payment.model.MeshPacket;
 import com.offline.payment.model.PaymentInstruction;
 import com.offline.payment.model.Transaction;
@@ -30,8 +29,8 @@ public class PaymentProcessorService {
     private final UserRepository userRepository;
     private final TransactionRepository transactionRepository;
     private final LedgerService ledgerService;
-    private final CacheService cacheService;
     private final OutboxService outboxService;
+    private final IdempotencyService idempotencyService;
 
     private static final long MAX_PACKET_AGE_MILLIS = 24L * 60 * 60 * 1000;
 
@@ -42,31 +41,28 @@ public class PaymentProcessorService {
                                    UserRepository userRepository,
                                    TransactionRepository transactionRepository,
                                    LedgerService ledgerService,
-                                   CacheService cacheService,
-                                   OutboxService outboxService) {
+                                   OutboxService outboxService,
+                                   IdempotencyService idempotencyService) {
         this.signatureService = signatureService;
         this.cryptoService = cryptoService;
         this.userRepository = userRepository;
         this.transactionRepository = transactionRepository;
         this.ledgerService = ledgerService;
-        this.cacheService = cacheService;
         this.outboxService = outboxService;
+        this.idempotencyService = idempotencyService;
     }
 
     public void processIncomingPacket(MeshPacket packet) throws Exception {
         String packetHash = generatePacketHash(packet.getCiphertext());
 
-        // STEP 1: Clone / replay defense (cache-first, then DB)
-        if (cacheService.isPacketHashProcessed(packetHash)) {
-            throw new SecurityException("Duplicate packet detected — this payment was already processed.");
-        }
+        // STEP 1: Replay defense (DB unique constraint on packet_hash)
         if (transactionRepository.existsByPacketHash(packetHash)) {
-            cacheService.markPacketHash(packetHash);
             throw new SecurityException("Duplicate packet detected — this payment was already processed.");
         }
 
-        // STEP 2: Fetch sender's public key (cache-first, then DB)
-        User sender = getSenderUser(packet.getSenderVpa());
+        // STEP 2: Fetch sender's public key
+        User sender = userRepository.findByVpa(packet.getSenderVpa())
+                .orElseThrow(() -> new SecurityException("Sender VPA not found: " + packet.getSenderVpa()));
         PublicKey senderPublicKey = sender.getPublicKey();
 
         // STEP 3: Verify signature
@@ -94,6 +90,17 @@ public class PaymentProcessorService {
             throw new SecurityException("Packet expired — older than 24 hours.");
         }
 
+        // STEP 6.5: Idempotency / double-spend check
+        String idempotencyKey = idempotencyService.generateKey(
+                instruction.getSenderVpa(),
+                instruction.getReceiverVpa(),
+                instruction.getAmount(),
+                instruction.getSignedAt()
+        );
+        if (idempotencyService.isDuplicate(idempotencyKey)) {
+            throw new IdempotencyConflictException("Double-spend detected: [" + idempotencyKey + "]");
+        }
+
         // STEP 7: Move the money (atomic debit/credit via native SQL)
         ledgerService.transferFunds(
                 instruction.getSenderVpa(),
@@ -105,23 +112,6 @@ public class PaymentProcessorService {
         saveTransactionRecord(packetHash, instruction, packet);
         outboxService.publishEvent(packetHash, instruction.getSenderVpa(),
                 instruction.getReceiverVpa(), instruction.getAmount());
-
-        // STEP 9: Mark hash in cache to prevent replay
-        cacheService.markPacketHash(packetHash);
-    }
-
-    private User getSenderUser(String senderVpa) throws Exception {
-        String cachedKey = cacheService.getCachedUser(senderVpa);
-        if (cachedKey != null) {
-            User cached = new User();
-            cached.setVpa(senderVpa);
-            cached.setPublicKeyBase64(cachedKey);
-            return cached;
-        }
-        User sender = userRepository.findByVpa(senderVpa)
-                .orElseThrow(() -> new SecurityException("Sender VPA not found: " + senderVpa));
-        cacheService.cacheUser(sender.getVpa(), sender.getPublicKeyBase64());
-        return sender;
     }
 
     private PaymentInstruction parseJsonToInstruction(String json) throws Exception {
